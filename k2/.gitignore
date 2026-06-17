@@ -1,0 +1,22 @@
+# Build
+build/
+*.so
+*.a
+*.o
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+
+# Models (generated, too large for git)
+models/*.pt
+models/*.onnx
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
