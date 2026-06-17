@@ -1,1 +1,3 @@
-status.log
+.vscode/
+openzl/
+*.log
