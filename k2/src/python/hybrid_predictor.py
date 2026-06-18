@@ -384,6 +384,98 @@ class ArithmeticEncoder:
 
 
 # ---------------------------------------------------------------------------
+# Arithmetic decoder — mirrors ArithmeticEncoder exactly
+# ---------------------------------------------------------------------------
+
+class ArithmeticDecoder:
+    """
+    Integer arithmetic decoder.
+    Precision: 32-bit range [0, 2^32).
+
+    Must be used with the same probability model and symbol count as the
+    corresponding ArithmeticEncoder.  The model state must be synchronised
+    symbol-by-symbol so both sides produce identical CDF tables.
+    """
+
+    FULL  = 1 << 32
+    HALF  = 1 << 31
+    QRTR  = 1 << 30
+    _3QTR = 3 * (1 << 30)
+
+    def __init__(self, data: bytes):
+        # Unpack all bits MSB-first (mirrors ArithmeticEncoder.flush)
+        self._bits: list[int] = []
+        for byte in data:
+            for i in range(7, -1, -1):
+                self._bits.append((byte >> i) & 1)
+        self._pos = 0
+
+        # Initialise value register with the first 32 bits
+        self._low   = 0
+        self._high  = self.FULL - 1
+        self._value = 0
+        for _ in range(32):
+            self._value = (self._value << 1) | self._read_bit()
+
+    def _read_bit(self) -> int:
+        if self._pos < len(self._bits):
+            b = self._bits[self._pos]
+            self._pos += 1
+            return b
+        return 0  # pad with zeros beyond end of stream
+
+    def decode_symbol(self, probs: np.ndarray) -> int:
+        """
+        Decode one symbol given a probability distribution over 256 values.
+        The distribution must be identical to the one used during encoding.
+        """
+        total = self._high - self._low + 1
+
+        # Build integer CDF — must exactly mirror ArithmeticEncoder.encode_symbol
+        cum = np.zeros(257, dtype=np.float64)
+        cum[1:] = np.cumsum(probs)
+        cum_int = np.clip(cum * total, 0, total).astype(np.int64)
+        for i in range(1, 257):
+            if cum_int[i] <= cum_int[i - 1]:
+                cum_int[i] = cum_int[i - 1] + 1
+        cum_int = np.clip(cum_int, 0, total)
+
+        # Find the symbol whose range contains (value - low)
+        scaled = self._value - self._low
+        lo, hi = 0, 255
+        while lo < hi:
+            mid = (lo + hi) // 2
+            if cum_int[mid + 1] <= scaled:
+                lo = mid + 1
+            else:
+                hi = mid
+        symbol = lo
+
+        # Update range to the symbol's sub-interval
+        self._high = self._low + int(cum_int[symbol + 1]) - 1
+        self._low  = self._low + int(cum_int[symbol])
+
+        # Renormalise — mirror encoder, but read bits instead of emitting them
+        while True:
+            if self._high < self.HALF:
+                self._low   *= 2
+                self._high   = self._high  * 2 + 1
+                self._value  = self._value * 2 + self._read_bit()
+            elif self._low >= self.HALF:
+                self._low   = (self._low   - self.HALF) * 2
+                self._high  = (self._high  - self.HALF) * 2 + 1
+                self._value = (self._value - self.HALF) * 2 + self._read_bit()
+            elif self._low >= self.QRTR and self._high < self._3QTR:
+                self._low   = (self._low   - self.QRTR) * 2
+                self._high  = (self._high  - self.QRTR) * 2 + 1
+                self._value = (self._value - self.QRTR) * 2 + self._read_bit()
+            else:
+                break
+
+        return symbol
+
+
+# ---------------------------------------------------------------------------
 # Main HybridPredictor façade
 # ---------------------------------------------------------------------------
 
@@ -491,15 +583,17 @@ class HybridPredictor:
     def compress_chunk(self, data: bytes) -> bytes:
         """
         Compress a single chunk using the hybrid model + arithmetic coding.
-        Returns compressed bytes prefixed with a 4-byte length header.
-        """
-        if True:
-            if ZSTD_AVAILABLE:
-                cctx = zstd.ZstdCompressor(level=3)
-                compressed = cctx.compress(data)
-                return struct.pack(">I", len(compressed)) + compressed
-            return struct.pack(">I", len(data)) + data
 
+        Wire format (per chunk):
+          4 bytes  chunk_payload_length  uint32 big-endian
+          1 byte   flag: 0x01 = arithmetic coded
+                         0x02 = zstd fallback
+                         0x03 = raw (no compression)
+          N bytes  payload
+
+        The flag byte lets decompress_chunk route correctly without
+        knowing which path was taken at encode time.
+        """
         enc = ArithmeticEncoder()
         context = b"\x00" * self._cfg.context_window
 
@@ -509,22 +603,85 @@ class HybridPredictor:
             context = (context + bytes([byte_val]))[-self._cfg.context_window:]
 
         encoded = enc.flush()
-        # Fallback: if arithmetic coding expanded the data, use Zstd
+
+        # Fallback: if arithmetic coding expanded the data, try zstd then raw
         if len(encoded) >= len(data):
             if ZSTD_AVAILABLE:
                 cctx = zstd.ZstdCompressor(level=3)
-                fallback = b"\x00" + cctx.compress(data)
-            else:
-                fallback = b"\x00" + data
-            return struct.pack(">I", len(fallback)) + fallback
+                fallback = cctx.compress(data)
+                if len(fallback) < len(data):
+                    payload = b"\x02" + fallback
+                    return struct.pack(">I", len(payload)) + payload
+            # Last resort: store raw
+            payload = b"\x03" + data
+            return struct.pack(">I", len(payload)) + payload
 
-        return struct.pack(">I", len(encoded)) + b"\x01" + encoded
+        payload = b"\x01" + encoded
+        return struct.pack(">I", len(payload)) + payload
+
+    def decompress_chunk(self, data: bytes, original_len: int) -> bytes:
+        """
+        Decompress one chunk produced by compress_chunk().
+        `data` starts immediately after the 4-byte length header.
+        `original_len` is the number of bytes to recover.
+        """
+        if not data:
+            raise ValueError("empty chunk payload")
+
+        flag = data[0]
+        payload = data[1:]
+
+        if flag == 0x01:
+            # Arithmetic-coded: decode symbol by symbol with same model state
+            dec = ArithmeticDecoder(payload)
+            context = b"\x00" * self._cfg.context_window
+            result = bytearray()
+            for _ in range(original_len):
+                probs = self.predict_probs(context)
+                b = dec.decode_symbol(probs)
+                # Update models online (mirrors compress_chunk)
+                ctx_byte = context[-1] if context else 0
+                self._stat.update(ctx_byte, b)
+                if isinstance(self._neural, LinearCMA):
+                    self._neural.update_weights(b)
+                    self._neural.advance(b)
+                context = (context + bytes([b]))[-self._cfg.context_window:]
+                result.append(b)
+            return bytes(result)
+
+        elif flag == 0x02:
+            # zstd fallback
+            if not ZSTD_AVAILABLE:
+                raise RuntimeError("zstd not available but chunk uses zstd flag")
+            dctx = zstd.ZstdDecompressor()
+            return dctx.decompress(payload, max_length=original_len * 2)
+
+        elif flag == 0x03:
+            # Raw stored
+            return payload
+
+        else:
+            raise ValueError(f"unknown chunk flag: {flag:#04x}")
 
     def compress(self, data: bytes) -> bytes:
-        """Compress full data stream in chunks."""
+        """
+        Compress full data stream in chunks.
+
+        Stream format:
+          4 bytes  original_size  uint32 big-endian
+          4 bytes  n_chunks       uint32 big-endian
+          Then n_chunks × (4-byte-length + flag + payload).
+
+        Model state is snapshotted before encoding so decompress()
+        can restore the identical starting state.
+        """
         self._stat.reset()
         if self._neural:
             self._neural.reset_state()
+
+        # Snapshot state AFTER reset, BEFORE any encoding.
+        # decompress() restores this so both sides start identically.
+        self._compress_state = self.save_state()
 
         chunks = [
             data[i:i + self._cfg.chunk_size]
@@ -535,6 +692,84 @@ class HybridPredictor:
         for chunk in chunks:
             parts.append(self.compress_chunk(chunk))
         return b"".join(parts)
+
+    def decompress(self, data: bytes) -> bytes:
+        """
+        Decompress a stream produced by compress().
+        Restores the exact model state used at the start of compression.
+        """
+        if len(data) < 8:
+            raise ValueError("stream too short for header")
+
+        original_size, n_chunks = struct.unpack(">II", data[:8])
+        pos = 8
+
+        # Restore model to the state captured at start of compress()
+        if hasattr(self, "_compress_state"):
+            self.restore_state(self._compress_state)
+        else:
+            self._stat.reset()
+            if self._neural:
+                self._neural.reset_state()
+
+        chunk_size = self._cfg.chunk_size
+        chunk_orig_lens = []
+        remaining = original_size
+        for _ in range(n_chunks):
+            cl = min(chunk_size, remaining)
+            chunk_orig_lens.append(cl)
+            remaining -= cl
+
+        parts = []
+        for i in range(n_chunks):
+            if pos + 4 > len(data):
+                raise ValueError(f"stream truncated at chunk {i}")
+            payload_len = struct.unpack(">I", data[pos:pos + 4])[0]
+            pos += 4
+            if pos + payload_len > len(data):
+                raise ValueError(f"chunk {i} payload truncated")
+            chunk_payload = data[pos:pos + payload_len]
+            pos += payload_len
+            parts.append(self.decompress_chunk(chunk_payload, chunk_orig_lens[i]))
+
+        result = b"".join(parts)
+        if len(result) != original_size:
+            raise ValueError(
+                f"size mismatch: got {len(result)}, expected {original_size}"
+            )
+        return result
+
+    # ------------------------------------------------------------------
+    # State snapshot — ensures encoder and decoder start from
+    # identical model state even after repeated compress calls.
+    # ------------------------------------------------------------------
+
+    def save_state(self) -> dict:
+        """
+        Snapshot mutable model state before compression.
+        Pass the result to restore_state() before the matching decompress().
+        """
+        state: dict = {"stat_counts": self._stat._counts.copy()}
+        if isinstance(self._neural, LinearCMA):
+            state["cma_weights"] = self._neural._weights.copy()
+            state["cma_losses"]  = self._neural._losses.copy()
+            state["cma_context"] = self._neural._context
+            state["cma_model_counts"] = [
+                {k: v.copy() for k, v in m["counts"].items()}
+                for m in self._neural._models
+            ]
+        return state
+
+    def restore_state(self, state: dict) -> None:
+        """Restore a snapshot produced by save_state()."""
+        self._stat._counts = state["stat_counts"].copy()
+        if isinstance(self._neural, LinearCMA) and "cma_weights" in state:
+            self._neural._weights  = state["cma_weights"].copy()
+            self._neural._losses   = state["cma_losses"].copy()
+            self._neural._context  = state["cma_context"]
+            for m, saved in zip(self._neural._models,
+                                state["cma_model_counts"]):
+                m["counts"] = {k: v.copy() for k, v in saved.items()}
 
     def reset(self) -> None:
         self._stat.reset()
