@@ -1,45 +1,49 @@
 /**
  * k2/include/k2_bridge.h
  *
- * C++ Bridge: K2 Neural Pipeline → OpenZL wire format
- * -----------------------------------------------------
- * Architecture (compress path):
+ * C++ Bridge: K2 Neural Pipeline
+ * --------------------------------
+ * K2Pipeline owns the full compression decision.  The C++ bridge:
+ *   - For zstd/zlib backends: passes K2 frames through unchanged.
+ *   - For OpenZL backend:     calls CCtx::compressSerial on the payload,
+ *                             then calls reseal_openzl_frame() to embed
+ *                             the result back into the K2 frame.
  *
- *   Raw bytes
- *       │
- *       ▼
- *   K2Pipeline (Python)       ← structure discovery + transforms
- *       │  pre-processed bytes
- *       ▼
- *   OpenZL CCtx::compressSerial  ← serial profile, produces valid .zl frame
- *       │
- *       ▼
- *   Valid OpenZL frame  ← decompressible by `zli decompress`
+ * K2 Frame Format (owned by Python, parsed by C++ for dispatch only):
+ *   [0..3]   magic  b'K2\xf7\x01'
+ *   [4]      version  0x01
+ *   [5]      backend  0x01=OpenZL  0x02=zstd  0x03=zlib
+ *   [6]      flags
+ *   [7]      reserved
+ *   [8..15]  orig_size  uint64 LE
+ *   [16..17] txhdr_len  uint16 LE
+ *   [18..]   txhdr + payload
  *
- * Architecture (decompress path):
+ * Compress path:
+ *   compress_full(data) → K2 frame
+ *   if backend == OPENZL:
+ *     payload = CCtx::compressSerial(frame.payload)
+ *     frame   = reseal_openzl_frame(frame, payload)
+ *   return frame
  *
- *   OpenZL frame
- *       │
- *       ▼
- *   OpenZL DCtx::decompress   ← reverses entropy coding
- *       │  pre-processed bytes
- *       ▼
- *   K2Pipeline.decompress()   ← reverses K2 transforms
- *       │
- *       ▼
- *   Original bytes
+ * Decompress path:
+ *   if backend == OPENZL:
+ *     inner = DCtx::decompressSerial(frame.payload)
+ *     reseal frame with decompressed inner as payload
+ *     decompress_full(resealed_frame) → original bytes
+ *   else:
+ *     decompress_full(frame) → original bytes  (Python does entropy)
  */
 
 #pragma once
 
+#include <chrono>
 #include <cstdint>
 #include <cstring>
-#include <memory>
 #include <stdexcept>
 #include <string>
 #include <vector>
 
-// Export macro
 #if defined(_WIN32)
 #  define K2_API __declspec(dllexport)
 #else
@@ -64,7 +68,7 @@ K2_API int k2_prepare(
     size_t         sample_len
 );
 
-/** Compress src → valid OpenZL frame in dst. */
+/** Compress src → K2 frame in dst. */
 K2_API int k2_compress(
     K2Handle*      handle,
     const uint8_t* src,
@@ -74,7 +78,7 @@ K2_API int k2_compress(
     size_t*        out_len
 );
 
-/** Decompress an OpenZL frame produced by k2_compress. */
+/** Decompress a K2 frame produced by k2_compress. */
 K2_API int k2_decompress(
     K2Handle*      handle,
     const uint8_t* src,
@@ -84,12 +88,20 @@ K2_API int k2_decompress(
     size_t*        out_len
 );
 
+/** Feed final compressed size back to the bandit. */
+K2_API void k2_record_result(
+    K2Handle* handle,
+    size_t    input_size,
+    size_t    output_size,
+    double    elapsed_ms
+);
+
 K2_API const char* k2_stats(K2Handle* handle);
 K2_API void        k2_free_str(const char* s);
 K2_API void        k2_destroy(K2Handle* handle);
 
 #ifdef __cplusplus
-}  // extern "C"
+}
 #endif
 
 
@@ -103,7 +115,6 @@ K2_API void        k2_destroy(K2Handle* handle);
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
 
-// OpenZL C++ API
 #include "openzl/cpp/CCtx.hpp"
 #include "openzl/cpp/Compressor.hpp"
 #include "openzl/cpp/DCtx.hpp"
@@ -118,7 +129,58 @@ using namespace pybind11::literals;
 namespace k2 {
 
 // ---------------------------------------------------------------------------
-// OpenZL serial profile compressor (built once, reused)
+// K2 frame constants (must match Python adaptive_optimizer.py)
+// ---------------------------------------------------------------------------
+
+static constexpr uint8_t  K2_FRAME_MAGIC[4] = {
+    uint8_t('K'), uint8_t('2'), uint8_t(0xf7), uint8_t(0x01)
+};
+static constexpr uint8_t  K2_FRAME_VERSION  = 0x01;
+static constexpr uint8_t  K2_BACKEND_OPENZL = 0x01;
+static constexpr uint8_t  K2_BACKEND_ZSTD   = 0x02;
+static constexpr uint8_t  K2_BACKEND_ZLIB   = 0x03;
+static constexpr size_t   K2_FRAME_HDR_SIZE = 18;  // through txhdr_len field
+
+struct K2FrameHeader {
+    uint8_t  magic[4];
+    uint8_t  version;
+    uint8_t  backend;
+    uint8_t  flags;
+    uint8_t  reserved;
+    uint64_t orig_size;
+    uint16_t txhdr_len;
+} __attribute__((packed));
+
+static_assert(sizeof(K2FrameHeader) == K2_FRAME_HDR_SIZE,
+              "K2FrameHeader size mismatch");
+
+static uint8_t frame_backend(const uint8_t* data, size_t len) {
+    if (len < K2_FRAME_HDR_SIZE) return 0;
+    const auto* h = reinterpret_cast<const K2FrameHeader*>(data);
+    if (std::memcmp(h->magic, K2_FRAME_MAGIC, 4) != 0) return 0;
+    return h->backend;
+}
+
+static uint64_t frame_orig_size(const uint8_t* data, size_t len) {
+    if (len < K2_FRAME_HDR_SIZE) return 0;
+    const auto* h = reinterpret_cast<const K2FrameHeader*>(data);
+    return h->orig_size;
+}
+
+static uint16_t frame_txhdr_len(const uint8_t* data, size_t len) {
+    if (len < K2_FRAME_HDR_SIZE) return 0;
+    const auto* h = reinterpret_cast<const K2FrameHeader*>(data);
+    return h->txhdr_len;
+}
+
+// Payload starts after fixed header + txhdr
+static size_t frame_payload_offset(const uint8_t* data, size_t len) {
+    return K2_FRAME_HDR_SIZE + frame_txhdr_len(data, len);
+}
+
+
+// ---------------------------------------------------------------------------
+// OpenZL serial compressor (built once, reused)
 // ---------------------------------------------------------------------------
 
 inline openzl::Compressor make_serial_compressor() {
@@ -130,6 +192,7 @@ inline openzl::Compressor make_serial_compressor() {
     comp.selectStartingGraph(graph);
     return comp;
 }
+
 
 // ---------------------------------------------------------------------------
 // Bridge
@@ -145,17 +208,12 @@ public:
     ) : _compressor(make_serial_compressor())
     {
         py::gil_scoped_acquire gil;
-
         py::module_ sys = py::module_::import("sys");
         sys.attr("path").attr("insert")(0, python_module_dir);
-
         py::module_ mod = py::module_::import("adaptive_optimizer");
         py::object  cls = mod.attr("K2Pipeline");
-
         py::object onnx = onnx_model_path.empty()
-            ? py::none()
-            : py::cast(onnx_model_path);
-
+            ? py::none() : py::cast(onnx_model_path);
         _pipeline = cls(
             "onnx_model_path"_a = onnx,
             "exploration"_a     = exploration,
@@ -171,92 +229,157 @@ public:
     }
 
     /**
-     * Compress: K2 transforms → OpenZL serial frame.
-     * Output is a valid .zl file decompressible by `zli decompress`.
+     * Compress data → K2 frame.
+     *
+     * 1. Call Python compress_full(data) → K2 frame bytes.
+     * 2. Inspect backend byte:
+     *    - ZSTD/ZLIB: frame is complete, return as-is.
+     *    - OPENZL: extract payload (pre-transform bytes), run CCtx,
+     *              call Python reseal_openzl_frame(frame, cctx_output).
      */
     std::vector<uint8_t> compress(const uint8_t* data, size_t len) {
-        // Step 1: K2 Python transforms
-        std::vector<uint8_t> transformed = k2_transform(data, len);
+        auto t0 = std::chrono::steady_clock::now();
 
-        // Step 2: OpenZL serial profile → valid .zl frame
-        openzl::CCtx cctx;
-        cctx.setParameter(openzl::CParam::FormatVersion, ZL_MAX_FORMAT_VERSION);
-        cctx.refCompressor(_compressor);
+        // Step 1: Python decides backend + transforms, returns K2 frame
+        std::vector<uint8_t> frame = call_compress_full(data, len);
 
-        std::string src(
-            reinterpret_cast<const char*>(transformed.data()),
-            transformed.size());
-        std::string dst = cctx.compressSerial(src);
+        uint8_t backend = frame_backend(frame.data(), frame.size());
 
-        return std::vector<uint8_t>(dst.begin(), dst.end());
+        if (backend == K2_BACKEND_OPENZL) {
+            // Step 2a: entropy-compress the payload with OpenZL
+            size_t poff  = frame_payload_offset(frame.data(), frame.size());
+            std::string src(
+                reinterpret_cast<const char*>(frame.data() + poff),
+                frame.size() - poff);
+
+            openzl::CCtx cctx;
+            cctx.setParameter(openzl::CParam::FormatVersion, ZL_MAX_FORMAT_VERSION);
+            cctx.refCompressor(_compressor);
+            std::string openzl_out = cctx.compressSerial(src);
+
+            // Step 2b: reseal frame with compressed payload
+            frame = call_reseal_openzl_frame(frame, openzl_out);
+        }
+        // For ZSTD/ZLIB backends frame is already final — nothing to do.
+
+        auto t1 = std::chrono::steady_clock::now();
+        double elapsed_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+        record_result(len, frame.size(), elapsed_ms);
+
+        return frame;
     }
 
     /**
-     * Decompress: OpenZL decompression → K2 inverse transforms.
+     * Decompress a K2 frame → original bytes.
+     *
+     * 1. Inspect backend:
+     *    - ZSTD/ZLIB: call Python decompress_full(frame) directly.
+     *    - OPENZL: extract payload, run DCtx, reseal frame with
+     *              decompressed payload, call Python decompress_full(resealed).
      */
     std::vector<uint8_t> decompress(const uint8_t* data, size_t len) {
-        // Step 1: OpenZL decompression
-        openzl::DCtx dctx;
-        std::string src(reinterpret_cast<const char*>(data), len);
-        std::string transformed = dctx.decompressSerial(src);
+        uint8_t backend = frame_backend(data, len);
 
-        // Step 2: K2 inverse transforms
-        return k2_inverse_transform(
-            reinterpret_cast<const uint8_t*>(transformed.data()),
-            transformed.size());
+        if (backend == K2_BACKEND_OPENZL) {
+            // Step 1: OpenZL entropy decompress
+            size_t poff = frame_payload_offset(data, len);
+            std::string src(
+                reinterpret_cast<const char*>(data + poff),
+                len - poff);
+            openzl::DCtx dctx;
+            std::string inner = dctx.decompressSerial(src);
+
+            // Step 2: reseal frame with decompressed payload
+            std::vector<uint8_t> resealed = call_reseal_openzl_frame(
+                std::vector<uint8_t>(data, data + len), inner);
+
+            // Step 3: Python handles transform inversion
+            return call_decompress_full(resealed.data(), resealed.size(),
+                                        frame_orig_size(data, len));
+        }
+
+        // ZSTD/ZLIB: Python does everything
+        return call_decompress_full(data, len, frame_orig_size(data, len));
     }
 
-    std::vector<uint8_t> compress(const std::vector<uint8_t>& data) {
-        return compress(data.data(), data.size());
+    std::vector<uint8_t> compress(const std::vector<uint8_t>& v) {
+        return compress(v.data(), v.size());
+    }
+    std::vector<uint8_t> decompress(const std::vector<uint8_t>& v) {
+        return decompress(v.data(), v.size());
     }
 
-    std::vector<uint8_t> decompress(const std::vector<uint8_t>& data) {
-        return decompress(data.data(), data.size());
+    void record_result(size_t input_size, size_t output_size, double elapsed_ms) {
+        py::gil_scoped_acquire gil;
+        try {
+            _pipeline.attr("update_final_score")(
+                py::str(""),
+                static_cast<uint64_t>(input_size),
+                static_cast<uint64_t>(output_size),
+                elapsed_ms
+            );
+        } catch (const py::error_already_set& e) {
+            fprintf(stderr, "k2_bridge: update_final_score failed: %s\n", e.what());
+            PyErr_Clear();
+        }
     }
 
     std::string stats() {
         py::gil_scoped_acquire gil;
         py::dict d = _pipeline.attr("stats")();
-        py::module_ json = py::module_::import("json");
-        return json.attr("dumps")(d).cast<std::string>();
+        return py::module_::import("json").attr("dumps")(d).cast<std::string>();
     }
 
 private:
     py::object          _pipeline;
     openzl::Compressor  _compressor;
 
-    // Call K2Pipeline.compress_transforms() — returns pre-processed bytes
-    // without the entropy coding step (Zstd), just the structural transforms.
-    std::vector<uint8_t> k2_transform(const uint8_t* data, size_t len) {
+    std::vector<uint8_t> call_compress_full(const uint8_t* data, size_t len) {
         py::gil_scoped_acquire gil;
         py::bytes input(reinterpret_cast<const char*>(data), len);
-        // compress() on the Python side applies transforms + Zstd.
-        // We intercept at the transform level by calling compress_transforms().
-        // If that method doesn't exist yet, fall back to raw bytes (transforms
-        // will be added to the Python layer in the next step).
-        py::bytes output;
         try {
-            output = _pipeline.attr("compress_transforms")(input);
-        } catch (const py::error_already_set&) {
-            // Fallback: return raw bytes, let OpenZL handle entropy only
+            py::bytes out = _pipeline.attr("compress_full")(input);
+            std::string s = out.cast<std::string>();
+            return std::vector<uint8_t>(s.begin(), s.end());
+        } catch (const py::error_already_set& e) {
+            fprintf(stderr, "k2_bridge: compress_full failed: %s\n", e.what());
             PyErr_Clear();
+            // Fallback: return raw bytes wrapped in a minimal zlib frame
+            // (Python side will handle on decompress)
             return std::vector<uint8_t>(data, data + len);
         }
-        std::string s = output.cast<std::string>();
-        return std::vector<uint8_t>(s.begin(), s.end());
     }
 
-    // Reverse K2 transforms after OpenZL decompression
-    std::vector<uint8_t> k2_inverse_transform(
-            const uint8_t* data, size_t len) {
+    std::vector<uint8_t> call_reseal_openzl_frame(
+        const std::vector<uint8_t>& frame,
+        const std::string& new_payload)
+    {
+        py::gil_scoped_acquire gil;
+        py::bytes py_frame(reinterpret_cast<const char*>(frame.data()), frame.size());
+        py::bytes py_payload(new_payload.data(), new_payload.size());
+        try {
+            py::bytes out = _pipeline.attr("reseal_openzl_frame")(py_frame, py_payload);
+            std::string s = out.cast<std::string>();
+            return std::vector<uint8_t>(s.begin(), s.end());
+        } catch (const py::error_already_set& e) {
+            fprintf(stderr, "k2_bridge: reseal_openzl_frame failed: %s\n", e.what());
+            PyErr_Clear();
+            return frame;
+        }
+    }
+
+    std::vector<uint8_t> call_decompress_full(
+        const uint8_t* data, size_t len, uint64_t orig_size)
+    {
         py::gil_scoped_acquire gil;
         py::bytes input(reinterpret_cast<const char*>(data), len);
         try {
-            py::bytes output = _pipeline.attr("decompress_transforms")(input);
-            std::string s = output.cast<std::string>();
+            py::bytes out = _pipeline.attr("decompress_full")(
+                input, static_cast<uint64_t>(orig_size));
+            std::string s = out.cast<std::string>();
             return std::vector<uint8_t>(s.begin(), s.end());
-        } catch (const py::error_already_set&) {
-            // Fallback: return as-is (no transforms to reverse yet)
+        } catch (const py::error_already_set& e) {
+            fprintf(stderr, "k2_bridge: decompress_full failed: %s\n", e.what());
             PyErr_Clear();
             return std::vector<uint8_t>(data, data + len);
         }
@@ -282,27 +405,23 @@ struct K2Handle {
     char*       last_stats = nullptr;
 };
 
-// k2_create and k2_destroy are in k2_bridge.cpp (manage interpreter lifetime)
-
 extern "C" {
 
 K2_API int k2_prepare(K2Handle* h, const uint8_t* sample, size_t len) {
     if (!h || !h->bridge) return -1;
-    try {
-        h->bridge->prepare(sample, len);
-        return 0;
-    } catch (...) { return -2; }
+    try { h->bridge->prepare(sample, len); return 0; }
+    catch (...) { return -2; }
 }
 
 K2_API int k2_compress(K2Handle* h,
-                const uint8_t* src, size_t src_len,
-                uint8_t* dst, size_t dst_cap, size_t* out_len) {
+                        const uint8_t* src, size_t src_len,
+                        uint8_t* dst, size_t dst_cap, size_t* out_len) {
     if (!h || !h->bridge || !dst || !out_len) return -1;
     try {
-        auto compressed = h->bridge->compress(src, src_len);
-        if (compressed.size() > dst_cap) return -3;
-        std::memcpy(dst, compressed.data(), compressed.size());
-        *out_len = compressed.size();
+        auto out = h->bridge->compress(src, src_len);
+        if (out.size() > dst_cap) return -3;
+        std::memcpy(dst, out.data(), out.size());
+        *out_len = out.size();
         return 0;
     } catch (const std::exception& e) {
         fprintf(stderr, "k2_compress error: %s\n", e.what());
@@ -311,19 +430,27 @@ K2_API int k2_compress(K2Handle* h,
 }
 
 K2_API int k2_decompress(K2Handle* h,
-                const uint8_t* src, size_t src_len,
-                uint8_t* dst, size_t dst_cap, size_t* out_len) {
+                          const uint8_t* src, size_t src_len,
+                          uint8_t* dst, size_t dst_cap, size_t* out_len) {
     if (!h || !h->bridge || !dst || !out_len) return -1;
     try {
-        auto decompressed = h->bridge->decompress(src, src_len);
-        if (decompressed.size() > dst_cap) return -3;
-        std::memcpy(dst, decompressed.data(), decompressed.size());
-        *out_len = decompressed.size();
+        auto out = h->bridge->decompress(src, src_len);
+        if (out.size() > dst_cap) return -3;
+        std::memcpy(dst, out.data(), out.size());
+        *out_len = out.size();
         return 0;
     } catch (const std::exception& e) {
         fprintf(stderr, "k2_decompress error: %s\n", e.what());
         return -2;
     } catch (...) { return -2; }
+}
+
+K2_API void k2_record_result(K2Handle* h,
+                              size_t input_size,
+                              size_t output_size,
+                              double elapsed_ms) {
+    if (!h || !h->bridge) return;
+    h->bridge->record_result(input_size, output_size, elapsed_ms);
 }
 
 K2_API const char* k2_stats(K2Handle* h) {
