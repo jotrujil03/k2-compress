@@ -86,12 +86,15 @@ target_include_directories(k2
     PRIVATE
         ${Python3_INCLUDE_DIRS}
         ${pybind11_INCLUDE_DIRS}
+        ${OPENZL_ROOT}/cpp/include
+        ${OPENZL_ROOT}/include
 )
 
 target_link_libraries(k2
     PRIVATE
         pybind11::embed
         openzl
+        openzl_cpp
         ${Python3_LIBRARIES}
 )
 
@@ -103,8 +106,12 @@ add_executable(k2cli
     src/cpp/k2cli.cpp
 )
 
-target_include_directories(k2cli PRIVATE ${K2_ROOT}/include)
-target_link_libraries(k2cli PRIVATE k2 openzl pybind11::embed)
+target_include_directories(k2cli PRIVATE
+    ${K2_ROOT}/include
+    ${OPENZL_ROOT}/cpp/include
+    ${OPENZL_ROOT}/include
+)
+target_link_libraries(k2cli PRIVATE k2 openzl openzl_cpp pybind11::embed)
 target_compile_definitions(k2cli PRIVATE K2_PYTHON_MODULE_DIR="${K2_PY_DIR}")
 
 # ---------------------------------------------------------------------------
@@ -120,8 +127,12 @@ if(K2_BUILD_TESTS)
         src/cpp/k2_test.cpp
     )
 
-    target_include_directories(k2_test PRIVATE ${K2_ROOT}/include)
-    target_link_libraries(k2_test PRIVATE k2 openzl pybind11::embed)
+    target_include_directories(k2_test PRIVATE
+        ${K2_ROOT}/include
+        ${OPENZL_ROOT}/cpp/include
+        ${OPENZL_ROOT}/include
+    )
+    target_link_libraries(k2_test PRIVATE k2 openzl openzl_cpp pybind11::embed)
     target_compile_definitions(k2_test PRIVATE K2_PYTHON_MODULE_DIR="${K2_PY_DIR}")
 
     add_test(NAME k2_bridge_test COMMAND k2_test)

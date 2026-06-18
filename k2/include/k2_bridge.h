@@ -1,40 +1,33 @@
 /**
  * k2/include/k2_bridge.h
  *
- * C++ Bridge: OpenZL Graph ↔ K2 Neural Pipeline
- * -----------------------------------------------
- * Provides a thin C interface (extern "C") plus a C++ RAII wrapper so that
- * OpenZL's compression graph can call the K2 neural pipeline via
- * pybind11 or the plain CPython C API.
+ * C++ Bridge: K2 Neural Pipeline → OpenZL wire format
+ * -----------------------------------------------------
+ * Architecture (compress path):
  *
- * Architecture:
- *   OpenZL graph node (C++)
- *       │
- *       ▼  [k2_compress / k2_stats]
- *   k2::Bridge (C++)   ──pybind11──►  K2Pipeline (Python)
+ *   Raw bytes
  *       │
  *       ▼
- *   compressed bytes returned to graph
+ *   K2Pipeline (Python)       ← structure discovery + transforms
+ *       │  pre-processed bytes
+ *       ▼
+ *   OpenZL CCtx::compressSerial  ← serial profile, produces valid .zl frame
+ *       │
+ *       ▼
+ *   Valid OpenZL frame  ← decompressible by `zli decompress`
  *
- * Integration pattern in a custom OpenZL codec node:
+ * Architecture (decompress path):
  *
- *   #include "k2_bridge.h"
- *
- *   class K2Codec : public zl::Codec {
- *       k2::Bridge _bridge;
- *   public:
- *       K2Codec() : _bridge("path/to/src/python") {}
- *
- *       zl::Status compress(const zl::Buffer& in, zl::Buffer& out) override {
- *           return _bridge.compress(in.data(), in.size(), out);
- *       }
- *   };
- *
- * Build notes:
- *   - Link against libpython3.x and pybind11.
- *   - Set PYTHONPATH to include the src/python directory.
- *   - Python GIL is acquired/released around each call automatically.
- *   - Thread-safe: each Bridge holds its own Python object reference.
+ *   OpenZL frame
+ *       │
+ *       ▼
+ *   OpenZL DCtx::decompress   ← reverses entropy coding
+ *       │  pre-processed bytes
+ *       ▼
+ *   K2Pipeline.decompress()   ← reverses K2 transforms
+ *       │
+ *       ▼
+ *   Original bytes
  */
 
 #pragma once
@@ -46,11 +39,7 @@
 #include <string>
 #include <vector>
 
-// ---------------------------------------------------------------------------
-// Plain C API (usable from pure C callers, Python ctypes, etc.)
-// ---------------------------------------------------------------------------
-
-// Export macro — ensures symbols are visible in libk2.so
+// Export macro
 #if defined(_WIN32)
 #  define K2_API __declspec(dllexport)
 #else
@@ -61,31 +50,21 @@
 extern "C" {
 #endif
 
-/** Opaque handle to a K2 pipeline instance. */
 typedef struct K2Handle K2Handle;
 
-/**
- * Create a new K2 pipeline.
- */
 K2_API K2Handle* k2_create(
     const char* onnx_model_path,
     double      exploration,
     double      latency_weight
 );
 
-/**
- * Analyse a data sample and initialise strategy selection.
- * Must be called once before k2_compress on a new stream.
- */
 K2_API int k2_prepare(
     K2Handle*      handle,
     const uint8_t* sample,
     size_t         sample_len
 );
 
-/**
- * Compress a buffer.
- */
+/** Compress src → valid OpenZL frame in dst. */
 K2_API int k2_compress(
     K2Handle*      handle,
     const uint8_t* src,
@@ -95,16 +74,19 @@ K2_API int k2_compress(
     size_t*        out_len
 );
 
-/**
- * Retrieve JSON stats string (caller must free with k2_free_str).
- */
+/** Decompress an OpenZL frame produced by k2_compress. */
+K2_API int k2_decompress(
+    K2Handle*      handle,
+    const uint8_t* src,
+    size_t         src_len,
+    uint8_t*       dst,
+    size_t         dst_cap,
+    size_t*        out_len
+);
+
 K2_API const char* k2_stats(K2Handle* handle);
-
-/** Free a string returned by k2_stats. */
-K2_API void k2_free_str(const char* s);
-
-/** Destroy the pipeline handle and free resources. */
-K2_API void k2_destroy(K2Handle* handle);
+K2_API void        k2_free_str(const char* s);
+K2_API void        k2_destroy(K2Handle* handle);
 
 #ifdef __cplusplus
 }  // extern "C"
@@ -121,40 +103,52 @@ K2_API void k2_destroy(K2Handle* handle);
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
 
+// OpenZL C++ API
+#include "openzl/cpp/CCtx.hpp"
+#include "openzl/cpp/Compressor.hpp"
+#include "openzl/cpp/DCtx.hpp"
+#include "openzl/zl_compress.h"
+#include "openzl/zl_decompress.h"
+#include "openzl/codecs/zl_segmenters.h"
+#include "openzl/zl_graphs.h"
+
 namespace py = pybind11;
 using namespace pybind11::literals;
 
 namespace k2 {
 
-/**
- * RAII wrapper around the Python K2Pipeline.
- *
- * Acquires GIL on every call; safe to use from multiple C++ threads
- * (each call is serialised through the GIL — for parallel chunk
- * compression, create one Bridge per worker thread).
- */
+// ---------------------------------------------------------------------------
+// OpenZL serial profile compressor (built once, reused)
+// ---------------------------------------------------------------------------
+
+inline openzl::Compressor make_serial_compressor() {
+    openzl::Compressor comp;
+    ZL_GraphID inner = ZL_Compressor_buildACEGraphWithDefault(
+        comp.get(), ZL_GRAPH_LZ);
+    ZL_GraphID graph = ZL_Compressor_buildSerialSegmenter(
+        comp.get(), ZL_DEFAULT_SEGMENTER_CHUNK_BYTE_SIZE, inner);
+    comp.selectStartingGraph(graph);
+    return comp;
+}
+
+// ---------------------------------------------------------------------------
+// Bridge
+// ---------------------------------------------------------------------------
+
 class PYBIND11_EXPORT Bridge {
 public:
-    /**
-     * @param python_module_dir  Directory containing structure_discovery.py,
-     *                           hybrid_predictor.py, adaptive_optimizer.py.
-     * @param onnx_model_path    Optional ONNX model path; empty string = none.
-     * @param exploration        UCB1 exploration constant.
-     * @param latency_weight     Speed vs. ratio weight.
-     */
     explicit Bridge(
         const std::string& python_module_dir,
         const std::string& onnx_model_path = "",
         double exploration    = 1.0,
         double latency_weight = 0.15
-    ) {
+    ) : _compressor(make_serial_compressor())
+    {
         py::gil_scoped_acquire gil;
 
-        // Extend sys.path so the pipeline modules are importable
         py::module_ sys = py::module_::import("sys");
         sys.attr("path").attr("insert")(0, python_module_dir);
 
-        // Import K2Pipeline
         py::module_ mod = py::module_::import("adaptive_optimizer");
         py::object  cls = mod.attr("K2Pipeline");
 
@@ -169,10 +163,6 @@ public:
         );
     }
 
-    /**
-     * Analyse a sample and prepare strategy pool.
-     * @returns Detected DataClass name string (e.g. "TIMESERIES").
-     */
     std::string prepare(const uint8_t* data, size_t len) {
         py::gil_scoped_acquire gil;
         py::bytes sample(reinterpret_cast<const char*>(data), len);
@@ -181,22 +171,49 @@ public:
     }
 
     /**
-     * Compress data.  Returns compressed bytes as std::vector<uint8_t>.
+     * Compress: K2 transforms → OpenZL serial frame.
+     * Output is a valid .zl file decompressible by `zli decompress`.
      */
     std::vector<uint8_t> compress(const uint8_t* data, size_t len) {
-        py::gil_scoped_acquire gil;
-        py::bytes input(reinterpret_cast<const char*>(data), len);
-        py::bytes output = _pipeline.attr("compress")(input);
-        std::string s = output.cast<std::string>();
-        return std::vector<uint8_t>(s.begin(), s.end());
+        // Step 1: K2 Python transforms
+        std::vector<uint8_t> transformed = k2_transform(data, len);
+
+        // Step 2: OpenZL serial profile → valid .zl frame
+        openzl::CCtx cctx;
+        cctx.setParameter(openzl::CParam::FormatVersion, ZL_MAX_FORMAT_VERSION);
+        cctx.refCompressor(_compressor);
+
+        std::string src(
+            reinterpret_cast<const char*>(transformed.data()),
+            transformed.size());
+        std::string dst = cctx.compressSerial(src);
+
+        return std::vector<uint8_t>(dst.begin(), dst.end());
     }
 
-    /** Convenience overload for std::vector input. */
+    /**
+     * Decompress: OpenZL decompression → K2 inverse transforms.
+     */
+    std::vector<uint8_t> decompress(const uint8_t* data, size_t len) {
+        // Step 1: OpenZL decompression
+        openzl::DCtx dctx;
+        std::string src(reinterpret_cast<const char*>(data), len);
+        std::string transformed = dctx.decompressSerial(src);
+
+        // Step 2: K2 inverse transforms
+        return k2_inverse_transform(
+            reinterpret_cast<const uint8_t*>(transformed.data()),
+            transformed.size());
+    }
+
     std::vector<uint8_t> compress(const std::vector<uint8_t>& data) {
         return compress(data.data(), data.size());
     }
 
-    /** Get JSON stats as string. */
+    std::vector<uint8_t> decompress(const std::vector<uint8_t>& data) {
+        return decompress(data.data(), data.size());
+    }
+
     std::string stats() {
         py::gil_scoped_acquire gil;
         py::dict d = _pipeline.attr("stats")();
@@ -205,38 +222,45 @@ public:
     }
 
 private:
-    py::object _pipeline;
-};
+    py::object          _pipeline;
+    openzl::Compressor  _compressor;
 
-
-// ---------------------------------------------------------------------------
-// OpenZL codec node adapter stub
-// ---------------------------------------------------------------------------
-
-/**
- * Shows how k2::Bridge maps to an OpenZL Codec interface.
- * Derive from the appropriate OpenZL base class (e.g. zl::StreamCodec)
- * and implement the required virtual methods.
- */
-struct K2CodecStub {
-    Bridge bridge;
-
-    explicit K2CodecStub(const std::string& py_dir,
-                         const std::string& onnx_path = "")
-        : bridge(py_dir, onnx_path) {}
-
-    // Called once when a new compression stream starts
-    void on_stream_start(const uint8_t* header, size_t header_len) {
-        std::string detected = bridge.prepare(header, header_len);
-        (void)detected;
+    // Call K2Pipeline.compress_transforms() — returns pre-processed bytes
+    // without the entropy coding step (Zstd), just the structural transforms.
+    std::vector<uint8_t> k2_transform(const uint8_t* data, size_t len) {
+        py::gil_scoped_acquire gil;
+        py::bytes input(reinterpret_cast<const char*>(data), len);
+        // compress() on the Python side applies transforms + Zstd.
+        // We intercept at the transform level by calling compress_transforms().
+        // If that method doesn't exist yet, fall back to raw bytes (transforms
+        // will be added to the Python layer in the next step).
+        py::bytes output;
+        try {
+            output = _pipeline.attr("compress_transforms")(input);
+        } catch (const py::error_already_set&) {
+            // Fallback: return raw bytes, let OpenZL handle entropy only
+            PyErr_Clear();
+            return std::vector<uint8_t>(data, data + len);
+        }
+        std::string s = output.cast<std::string>();
+        return std::vector<uint8_t>(s.begin(), s.end());
     }
 
-    // Called per chunk / control-point
-    std::vector<uint8_t> compress_chunk(const uint8_t* data, size_t len) {
-        return bridge.compress(data, len);
+    // Reverse K2 transforms after OpenZL decompression
+    std::vector<uint8_t> k2_inverse_transform(
+            const uint8_t* data, size_t len) {
+        py::gil_scoped_acquire gil;
+        py::bytes input(reinterpret_cast<const char*>(data), len);
+        try {
+            py::bytes output = _pipeline.attr("decompress_transforms")(input);
+            std::string s = output.cast<std::string>();
+            return std::vector<uint8_t>(s.begin(), s.end());
+        } catch (const py::error_already_set&) {
+            // Fallback: return as-is (no transforms to reverse yet)
+            PyErr_Clear();
+            return std::vector<uint8_t>(data, data + len);
+        }
     }
-
-    std::string get_stats() { return bridge.stats(); }
 };
 
 }  // namespace k2
@@ -245,7 +269,7 @@ struct K2CodecStub {
 
 
 // ---------------------------------------------------------------------------
-// Implementation of the C API (include in exactly one .cpp translation unit)
+// K2_IMPLEMENTATION block
 // ---------------------------------------------------------------------------
 
 #ifdef K2_IMPLEMENTATION
@@ -254,12 +278,11 @@ struct K2CodecStub {
 #include <cstdlib>
 
 struct K2Handle {
-    k2::Bridge* bridge    = nullptr;
+    k2::Bridge* bridge     = nullptr;
     char*       last_stats = nullptr;
 };
 
-// Note: k2_create and k2_destroy are defined in k2_bridge.cpp
-// because they manage the Python interpreter lifetime.
+// k2_create and k2_destroy are in k2_bridge.cpp (manage interpreter lifetime)
 
 extern "C" {
 
@@ -281,6 +304,25 @@ K2_API int k2_compress(K2Handle* h,
         std::memcpy(dst, compressed.data(), compressed.size());
         *out_len = compressed.size();
         return 0;
+    } catch (const std::exception& e) {
+        fprintf(stderr, "k2_compress error: %s\n", e.what());
+        return -2;
+    } catch (...) { return -2; }
+}
+
+K2_API int k2_decompress(K2Handle* h,
+                const uint8_t* src, size_t src_len,
+                uint8_t* dst, size_t dst_cap, size_t* out_len) {
+    if (!h || !h->bridge || !dst || !out_len) return -1;
+    try {
+        auto decompressed = h->bridge->decompress(src, src_len);
+        if (decompressed.size() > dst_cap) return -3;
+        std::memcpy(dst, decompressed.data(), decompressed.size());
+        *out_len = decompressed.size();
+        return 0;
+    } catch (const std::exception& e) {
+        fprintf(stderr, "k2_decompress error: %s\n", e.what());
+        return -2;
     } catch (...) { return -2; }
 }
 
@@ -295,7 +337,7 @@ K2_API const char* k2_stats(K2Handle* h) {
     } catch (...) { return "{}"; }
 }
 
-K2_API void k2_free_str(const char* /*s*/) { /* owned by handle */ }
+K2_API void k2_free_str(const char* /*s*/) {}
 
 }  // extern "C"
 

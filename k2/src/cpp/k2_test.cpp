@@ -12,6 +12,7 @@
 #include <string>
 #include <vector>
 
+#include "openzl/zl_compress.h"
 #include "k2_bridge.h"
 
 // ---------------------------------------------------------------------------
@@ -191,9 +192,64 @@ static void test_cpp_bridge() {
     CHECK(ratio > 1.0, "C++ bridge achieves compression");
 }
 
-// ---------------------------------------------------------------------------
-// main
-// ---------------------------------------------------------------------------
+static void test_roundtrip_timeseries() {
+    std::printf("\n[test_roundtrip_timeseries]\n");
+    auto data = make_timeseries(4096);
+    K2Handle* h = k2_create(nullptr, 0.0, 0.15);
+    k2_prepare(h, data.data(), data.size());
+
+    // Compress
+    std::vector<uint8_t> compressed(ZL_compressBound(data.size()) + 4096);
+    size_t comp_len = 0;
+    int rc = k2_compress(h, data.data(), data.size(),
+                          compressed.data(), compressed.size(), &comp_len);
+    CHECK(rc == 0, "compress succeeds");
+
+    // Decompress
+    std::vector<uint8_t> restored(data.size() * 2);
+    size_t rest_len = 0;
+    rc = k2_decompress(h, compressed.data(), comp_len,
+                        restored.data(), restored.size(), &rest_len);
+    CHECK(rc == 0,                          "decompress succeeds");
+    CHECK(rest_len == data.size(),          "restored size matches");
+    CHECK(std::memcmp(restored.data(),
+                      data.data(),
+                      rest_len) == 0,       "restored bytes match");
+
+    double ratio = static_cast<double>(data.size()) / comp_len;
+    std::printf("    ratio: %.2fx\n", ratio);
+
+    k2_destroy(h);
+}
+
+static void test_roundtrip_text() {
+    std::printf("\n[test_roundtrip_text]\n");
+    auto data = make_text(8192);
+    K2Handle* h = k2_create(nullptr, 0.0, 0.15);
+    k2_prepare(h, data.data(), data.size());
+
+    std::vector<uint8_t> compressed(ZL_compressBound(data.size()) + 4096);
+    size_t comp_len = 0;
+    k2_compress(h, data.data(), data.size(),
+                compressed.data(), compressed.size(), &comp_len);
+
+    std::vector<uint8_t> restored(data.size() * 2);
+    size_t rest_len = 0;
+    int rc = k2_decompress(h, compressed.data(), comp_len,
+                            restored.data(), restored.size(), &rest_len);
+    CHECK(rc == 0,                          "decompress succeeds");
+    CHECK(rest_len == data.size(),          "restored size matches");
+    CHECK(std::memcmp(restored.data(),
+                      data.data(),
+                      rest_len) == 0,       "restored bytes match");
+
+    double ratio = static_cast<double>(data.size()) / comp_len;
+    std::printf("    ratio: %.2fx\n", ratio);
+
+    k2_destroy(h);
+}
+
+
 
 int main() {
     std::printf("=== K2 C++ Bridge Tests ===\n");
@@ -206,6 +262,9 @@ int main() {
     test_stats_returns_json();
     test_null_handle_safety();
     test_cpp_bridge();
+
+    test_roundtrip_timeseries();
+    test_roundtrip_text();
 
     std::printf("\n%d passed, %d failed\n", g_passed, g_failed);
     return g_failed > 0 ? 1 : 0;
