@@ -17,16 +17,29 @@ set(K2_PY_DIR      ${K2_ROOT}/src/python)
 # OpenZL
 # ---------------------------------------------------------------------------
 
-if(NOT EXISTS ${OPENZL_ROOT}/CMakeLists.txt)
-    message(FATAL_ERROR "OpenZL not found at ${OPENZL_ROOT}. "
-            "Clone it with: git clone --depth 1 -b release "
-            "https://github.com/facebook/openzl.git ../openzl")
-endif()
+# if(NOT EXISTS ${OPENZL_ROOT}/CMakeLists.txt)
+#    message(FATAL_ERROR "OpenZL not found at ${OPENZL_ROOT}. "
+#            "Clone it with: git clone --depth 1 -b release "
+#            "https://github.com/facebook/openzl.git ../openzl")
+# endif()
 
 # Build OpenZL as a subdirectory (gives us the zl target)
-set(OPENZL_BUILD_TESTS OFF CACHE BOOL "" FORCE)
-set(OPENZL_BUILD_TOOLS OFF CACHE BOOL "" FORCE)
-add_subdirectory(${OPENZL_ROOT} openzl_build)
+# set(OPENZL_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+# set(OPENZL_BUILD_TOOLS OFF CACHE BOOL "" FORCE)
+# add_subdirectory(${OPENZL_ROOT} openzl_build)
+
+# ---------------------------------------------------------------------------
+# ASDP-LH (Replaces OpenZL)
+# ---------------------------------------------------------------------------
+
+set(ASDP_ROOT ${K2_ROOT}/../asdp-lh)
+if(NOT EXISTS ${ASDP_ROOT}/CMakeLists.txt)
+    message(FATAL_ERROR "ASDP-LH not found at ${ASDP_ROOT}.")
+endif()
+
+# Build ASDP-LH as a subdirectory
+set(ASDP_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+add_subdirectory(${ASDP_ROOT} asdp_build)
 
 # ---------------------------------------------------------------------------
 # Python 3.14
@@ -86,15 +99,17 @@ target_include_directories(k2
     PRIVATE
         ${Python3_INCLUDE_DIRS}
         ${pybind11_INCLUDE_DIRS}
-        ${OPENZL_ROOT}/cpp/include
-        ${OPENZL_ROOT}/include
+        # ${OPENZL_ROOT}/cpp/include
+        # ${OPENZL_ROOT}/include
+        ${ASDP_ROOT}/include
 )
 
 target_link_libraries(k2
     PRIVATE
         pybind11::embed
-        openzl
-        openzl_cpp
+        # openzl
+        # openzl_cpp
+        asdp
         ${Python3_LIBRARIES}
 )
 
@@ -111,7 +126,14 @@ target_include_directories(k2cli PRIVATE
     ${OPENZL_ROOT}/cpp/include
     ${OPENZL_ROOT}/include
 )
-target_link_libraries(k2cli PRIVATE k2 openzl openzl_cpp pybind11::embed)
+target_link_libraries(k2cli 
+    PRIVATE 
+        k2 
+        # openzl 
+        # openzl_cpp 
+        asdp
+        pybind11::embed
+)
 target_compile_definitions(k2cli PRIVATE K2_PYTHON_MODULE_DIR="${K2_PY_DIR}")
 
 # ---------------------------------------------------------------------------
@@ -132,7 +154,14 @@ if(K2_BUILD_TESTS)
         ${OPENZL_ROOT}/cpp/include
         ${OPENZL_ROOT}/include
     )
-    target_link_libraries(k2_test PRIVATE k2 openzl openzl_cpp pybind11::embed)
+    target_link_libraries(k2_test 
+        PRIVATE 
+            k2 
+            # openzl 
+            # openzl_cpp 
+            asdp
+            pybind11::embed
+    )
     target_compile_definitions(k2_test PRIVATE K2_PYTHON_MODULE_DIR="${K2_PY_DIR}")
 
     add_test(NAME k2_bridge_test COMMAND k2_test)

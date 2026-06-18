@@ -60,13 +60,11 @@ def make_random_blob(n: int = 8192) -> bytes:
 
 
 def make_columnar(rows: int = 2048, cols: int = 8, stride: int = 4) -> bytes:
-    """Simulate struct-of-arrays style data with periodic column structure."""
+    """Simulate struct-of-arrays style data."""
     data = bytearray()
-    col_bases = [RNG.integers(0, 500) for _ in range(cols)]
-    for r in range(rows):
+    for _ in range(rows):
         for c in range(cols):
-            col_bases[c] += int(RNG.integers(0, 5))
-            data += struct.pack("<i", col_bases[c])
+            data += struct.pack("<i", int(RNG.integers(-1000, 1000)))
     return bytes(data)
 
 

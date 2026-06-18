@@ -1,6 +1,9 @@
 # OpenZL upstream — never commit
 openzl/
 
+# Silesia
+silesia/
+
 # Build artifacts
 build/
 cmake-build-*/
@@ -36,6 +39,7 @@ k2/models/*.onnx
 *.log
 *.tmp
 *.bak
+*.zip
 
 # macOS
 .DS_Store
