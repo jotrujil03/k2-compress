@@ -3,36 +3,34 @@ k2/src/python/adaptive_optimizer.py
 
 Adaptive Optimization Layer — K2
 ----------------------------------
-K2Pipeline owns the full compression decision: backend selection, transforms,
-and entropy coding.  The C++ bridge is a thin shim that executes the OpenZL
-call when K2Pipeline requests it.
+K2Pipeline owns the full compression decision: backend selection and structural
+transforms.  All entropy coding is performed by the ASDP-LH C++ backend
+(backend 0x04); there is no zstd/zlib fallback.
 
 Backend selection per DataClass:
-  TIMESERIES / INTEGER  → K2 transforms (delta/zigzag) + OpenZL LZ
-  FLOAT                 → K2 transforms (bytesplit)    + zstd
-  TEXT                  → zstd directly (no transforms)
-  COLUMNAR              → K2 transforms (columnsplit)  + zstd
-  BINARY_BLOB / UNKNOWN → zstd directly
+  All classes → ASDP-LH entropy backend
+  Structural transforms vary by class:
+    TIMESERIES / INTEGER  → delta ± zigzag
+    FLOAT                 → bytesplit ± delta
+    COLUMNAR              → columnsplit ± delta
+    TEXT / BINARY / OTHER → no transforms
 
 K2 Frame Format
 ---------------
 Offset  Size  Field
 0       4     magic  b'K2\\xf7\\x01'
 4       1     version  0x01
-5       1     backend  0x02=zstd  0x03=zlib-fallback  0x04=ASDP  (0x01 OpenZL retired)
+5       1     backend  0x04=ASDP  (0x01/02/03 retired)
 6       1     flags    bit0=transforms_applied  rest reserved
 7       1     reserved 0x00
 8       8     orig_size  uint64 LE
 16      2     txhdr_len  uint16 LE
-18      N     transform_header (K2T\\x01 ... same format as before)
-18+N    ...   backend payload
+18      N     transform_header (K2T\\x01 ...)
+18+N    ...   ASDP frame (output of asdp_compress)
 
-The C++ bridge reads the frame, and:
-  - backend=ASDP   → calls asdp_compress(payload), replaces payload,
-                     re-seals frame.  On decompress: asdp_decompress then K2 inv.
-  - backend=zstd   → payload is already a complete zstd frame.
-                     No ASDP call.  On decompress: zstd_decompress then K2 inv.
-  - backend=zlib   → same as zstd but zlib (fallback when zstandard absent).
+The C++ bridge reads the frame and:
+  - backend=ASDP → calls asdp_compress(payload), reseals frame.
+                   On decompress: asdp_decompress then invert transforms.
 """
 
 from __future__ import annotations
@@ -41,7 +39,7 @@ import math
 import struct
 import threading
 import time
-import zlib
+import zlib   # used only for the transform-gain probe heuristic (_zlib1_ratio)
 from collections import deque
 from dataclasses import dataclass, field
 from typing import Callable, Optional
@@ -51,16 +49,6 @@ import numpy as np
 from structure_discovery import StructureHint, DataClass
 from hybrid_predictor import HybridConfig, PredictorMode
 
-try:
-    import zstandard as zstd_mod
-    _ZSTD_AVAILABLE = True
-    _zstd_cctx = zstd_mod.ZstdCompressor(level=3)
-    _zstd_dctx = zstd_mod.ZstdDecompressor()
-except ImportError:
-    _ZSTD_AVAILABLE = False
-    _zstd_cctx = None
-    _zstd_dctx = None
-
 
 # ---------------------------------------------------------------------------
 # K2 frame constants
@@ -68,32 +56,10 @@ except ImportError:
 
 _FRAME_MAGIC      = b"K2\xf7\x01"
 _FRAME_VERSION    = 0x01
-_BACKEND_OPENZL   = 0x01   # retired — OpenZL removed; kept for legacy decode only
-_BACKEND_ZSTD     = 0x02
-_BACKEND_ZLIB     = 0x03   # fallback when zstandard not installed
-_BACKEND_ASDP     = 0x04   # ASDP-LH entropy backend (C++ bridge runs it)
+_BACKEND_ASDP     = 0x04   # sole entropy backend
 _FLAG_TRANSFORMS  = 0x01
 _FRAME_HDR_STRUCT = struct.Struct("<4sBBBBQH")   # 18 bytes
 _FRAME_HDR_SIZE   = _FRAME_HDR_STRUCT.size       # 18
-
-
-def _best_entropy_backend() -> int:
-    """Return the backend ID to use for zstd-class data."""
-    return _BACKEND_ZSTD if _ZSTD_AVAILABLE else _BACKEND_ZLIB
-
-
-def _entropy_compress(data: bytes) -> bytes:
-    """Compress with zstd (or zlib fallback)."""
-    if _ZSTD_AVAILABLE:
-        return _zstd_cctx.compress(data)
-    return zlib.compress(data, 3)
-
-
-def _entropy_decompress(data: bytes, max_length: int) -> bytes:
-    """Decompress zstd or zlib frame."""
-    if _ZSTD_AVAILABLE:
-        return _zstd_dctx.decompress(data, max_length=max_length)
-    return zlib.decompress(data)
 
 
 # ---------------------------------------------------------------------------
@@ -109,9 +75,8 @@ def encode_k2_frame(
     """
     Build a complete K2 frame.
 
-    For backend=OPENZL the payload is pre-transform bytes; the C++ bridge
-    replaces it with the OpenZL-compressed output and re-seals the frame.
-    For backend=ZSTD/ZLIB the payload is already the final compressed bytes.
+    payload is pre-transform bytes; the C++ bridge replaces it with the
+    ASDP-compressed output and re-seals the frame.
     """
     flags = _FLAG_TRANSFORMS if txhdr and len(txhdr) > 5 else 0x00
     hdr = _FRAME_HDR_STRUCT.pack(
@@ -163,9 +128,8 @@ class Strategy:
     predictor_mode: PredictorMode
     alpha: float
     chunk_size: int
-    zstd_level: int
     transforms: list[str]
-    backend: int = field(default=0)  # 0 = use class default
+    backend: int = field(default=_BACKEND_ASDP)
 
     _n_plays: int = field(default=0, repr=False)
     _total_score: float = field(default=0.0, repr=False)
@@ -197,61 +161,56 @@ def _default_strategies_for(hint: StructureHint) -> list[Strategy]:
 
     if cls == DataClass.TIMESERIES:
         strategies += [
-            Strategy("ts_delta_zigzag", PredictorMode.LINEAR_CMA, 0.3, 4096, 3,
-                     [f"bytedelta-{w}", "zigzag"], _BACKEND_ASDP),
-            Strategy("ts_delta_only",   PredictorMode.LINEAR_CMA, 0.3, 4096, 3,
-                     [f"bytedelta-{w}"], _BACKEND_ASDP),
-            Strategy("ts_raw",          PredictorMode.PASSTHROUGH, 0.0, 4096, 3,
-                     [], _BACKEND_ASDP),
+            Strategy("ts_delta_zigzag", PredictorMode.LINEAR_CMA, 0.3, 4096,
+                     [f"bytedelta-{w}", "zigzag"]),
+            Strategy("ts_delta_only",   PredictorMode.LINEAR_CMA, 0.3, 4096,
+                     [f"bytedelta-{w}"]),
+            Strategy("ts_raw",          PredictorMode.PASSTHROUGH, 0.0, 4096,
+                     []),
         ]
     elif cls == DataClass.INTEGER_ARRAY:
         strategies += [
-            Strategy("int_delta",        PredictorMode.LINEAR_CMA, 0.3, 4096, 3,
-                     [f"bytedelta-{w}"], _BACKEND_ASDP),
-            Strategy("int_delta_zigzag", PredictorMode.LINEAR_CMA, 0.3, 4096, 3,
-                     [f"bytedelta-{w}", "zigzag"], _BACKEND_ASDP),
-            Strategy("int_raw",          PredictorMode.PASSTHROUGH, 0.0, 4096, 3,
-                     [], _BACKEND_ASDP),
+            Strategy("int_delta",        PredictorMode.LINEAR_CMA, 0.3, 4096,
+                     [f"bytedelta-{w}"]),
+            Strategy("int_delta_zigzag", PredictorMode.LINEAR_CMA, 0.3, 4096,
+                     [f"bytedelta-{w}", "zigzag"]),
+            Strategy("int_raw",          PredictorMode.PASSTHROUGH, 0.0, 4096,
+                     []),
         ]
     elif cls == DataClass.FLOAT_ARRAY:
-        eb = _best_entropy_backend()
         strategies += [
-            Strategy("fp_split_delta",  PredictorMode.LINEAR_CMA, 0.25, 8192, 3,
-                     [f"bytesplit-{w}", f"bytedelta-{w}"], eb),
-            Strategy("fp_split_only",   PredictorMode.LINEAR_CMA, 0.25, 4096, 3,
-                     [f"bytesplit-{w}"], eb),
-            Strategy("fp_raw",          PredictorMode.PASSTHROUGH, 0.0,  4096, 3,
-                     [], eb),
+            Strategy("fp_split_delta",  PredictorMode.LINEAR_CMA, 0.25, 8192,
+                     [f"bytesplit-{w}", f"bytedelta-{w}"]),
+            Strategy("fp_split_only",   PredictorMode.LINEAR_CMA, 0.25, 4096,
+                     [f"bytesplit-{w}"]),
+            Strategy("fp_raw",          PredictorMode.PASSTHROUGH, 0.0, 4096,
+                     []),
         ]
     elif cls == DataClass.COLUMNAR:
-        s  = hint.column_stride or 8
-        eb = _best_entropy_backend()
+        s = hint.column_stride or 8
         strategies += [
-            Strategy("col_split_delta", PredictorMode.LINEAR_CMA, 0.35, 4096, 3,
-                     [f"columnsplit-{s}", "bytedelta-4"], eb),
-            Strategy("col_split_only",  PredictorMode.PASSTHROUGH, 0.0, 4096, 3,
-                     [f"columnsplit-{s}"], eb),
-            Strategy("col_raw",         PredictorMode.PASSTHROUGH, 0.0, 4096, 3,
-                     [], eb),
+            Strategy("col_split_delta", PredictorMode.LINEAR_CMA, 0.35, 4096,
+                     [f"columnsplit-{s}", "bytedelta-4"]),
+            Strategy("col_split_only",  PredictorMode.PASSTHROUGH, 0.0, 4096,
+                     [f"columnsplit-{s}"]),
+            Strategy("col_raw",         PredictorMode.PASSTHROUGH, 0.0, 4096,
+                     []),
         ]
     elif cls == DataClass.TEXT:
-        eb = _best_entropy_backend()
         strategies += [
-            Strategy("text_cma",         PredictorMode.LINEAR_CMA, 0.45, 2048, 3,
-                     [], eb),
-            Strategy("text_passthrough", PredictorMode.PASSTHROUGH, 0.0, 4096, 3,
-                     [], eb),
+            Strategy("text_cma",         PredictorMode.LINEAR_CMA, 0.45, 2048,
+                     []),
+            Strategy("text_passthrough", PredictorMode.PASSTHROUGH, 0.0, 4096,
+                     []),
         ]
     else:
         # BINARY_BLOB / UNKNOWN / MIXED
-        eb = _best_entropy_backend()
         strategies += [
-            Strategy("blob_raw", PredictorMode.PASSTHROUGH, 0.0, 4096, 3, [], eb),
+            Strategy("blob_raw", PredictorMode.PASSTHROUGH, 0.0, 4096, []),
         ]
 
     strategies.append(
-        Strategy("raw_fallback", PredictorMode.PASSTHROUGH, 0.0, 4096, 3,
-                 [], _best_entropy_backend())
+        Strategy("raw_fallback", PredictorMode.PASSTHROUGH, 0.0, 4096, [])
     )
     return strategies
 
@@ -309,8 +268,7 @@ class AdaptiveOptimizer:
         self._strategies: dict[str, Strategy] = {s.name: s for s in base + extra}
         if not self._strategies:
             self._strategies["raw_fallback"] = Strategy(
-                "raw_fallback", PredictorMode.PASSTHROUGH, 0.0, 4096, 3,
-                [], _best_entropy_backend()
+                "raw_fallback", PredictorMode.PASSTHROUGH, 0.0, 4096, []
             )
         self._current: Optional[Strategy] = None
 
@@ -470,13 +428,11 @@ _OP_COLUMNSPLIT = 0x03
 _OP_ZIGZAG      = 0x04
 _OP_BWT         = 0x10   # no-op, kept for compat
 _OP_MTF         = 0x11   # no-op, kept for compat
-_OP_ZSTD        = 0xFF   # never stored
 
 def _parse_transform_name(name: str) -> tuple[int, int]:
     if name == "zigzag":   return (_OP_ZIGZAG, 0)
     if name == "bwt":      return (_OP_BWT, 0)
     if name == "mtf":      return (_OP_MTF, 0)
-    if name == "zstd":     return (_OP_ZSTD, 0)
     parts = name.split("-")
     if len(parts) == 2:
         kind, param_s = parts
@@ -493,7 +449,7 @@ def _ops_from_transforms(transforms: list[str]) -> list[tuple[int, int]]:
     ops = []
     for t in transforms:
         op, param = _parse_transform_name(t)
-        if op not in (0, _OP_ZSTD, _OP_BWT, _OP_MTF):
+        if op not in (0, _OP_BWT, _OP_MTF):
             ops.append((op, param))
     return ops
 
@@ -588,7 +544,7 @@ class K2Pipeline:
         # Active state refreshed on each compress_full() call
         self._active_ops:      list[tuple[int, int]] = []
         self._active_txhdr:    bytes = _encode_txhdr([])
-        self._active_backend:  int   = _best_entropy_backend()
+        self._active_backend:  int   = _BACKEND_ASDP
         self._active_strategy: str   = ""
 
     # ------------------------------------------------------------------
@@ -637,7 +593,7 @@ class K2Pipeline:
                 ops = []
         self._active_ops      = ops
         self._active_txhdr    = _encode_txhdr(ops)
-        self._active_backend  = strategy.backend or _best_entropy_backend()
+        self._active_backend  = _BACKEND_ASDP
         self._active_strategy = strategy.name
 
     # ------------------------------------------------------------------
@@ -648,14 +604,10 @@ class K2Pipeline:
         """
         Compress `data` and return a complete K2 frame.
 
-        Backend=ZSTD/ZLIB: frame payload is the final compressed bytes.
-          C++ bridge passes the frame through unchanged.
+        The payload is always pre-transform bytes; the C++ bridge calls
+        asdp_compress(payload) then reseal_frame().
 
-        Backend=OPENZL: frame payload is pre-transformed bytes.
-          C++ bridge must call CCtx::compressSerial(payload) and then
-          call reseal_openzl_frame(frame, openzl_output) before writing.
-
-        Always returns bytes.  Never raises (falls back to raw on error).
+        Always returns bytes.  Never raises (falls back to raw frame on error).
         """
         if self._optimizer is None:
             self.prepare(data[:min(len(data), 65536)])
@@ -663,29 +615,12 @@ class K2Pipeline:
         strategy = self._optimizer.select_strategy()
         self._refresh(strategy)
 
-        # Apply structural transforms
+        # Apply structural transforms; pass pre-transform bytes to C++ ASDP.
         transformed = _apply_chain(data, self._active_ops)
 
-        if self._active_backend in (_BACKEND_OPENZL, _BACKEND_ASDP):
-            # C++ will run the entropy backend (ASDP); we return the
-            # pre-transform payload.  The C++ bridge calls reseal_frame()
-            # after asdp_compress() returns.
-            payload = transformed
-        else:
-            # Run entropy compression in Python.
-            t0      = time.perf_counter()
-            payload = _entropy_compress(transformed)
-            elapsed = (time.perf_counter() - t0) * 1000.0
-            # Record score now (we have the final size).
-            self._optimizer.record_result(
-                strategy.name, len(data), len(payload), elapsed
-            )
-            if strategy._n_plays % 10 == 0:
-                self._optimizer.tune_alpha(strategy)
-
         return encode_k2_frame(
-            self._active_backend, len(data),
-            self._active_txhdr, payload
+            _BACKEND_ASDP, len(data),
+            self._active_txhdr, transformed
         )
 
     # ------------------------------------------------------------------
@@ -739,47 +674,33 @@ class K2Pipeline:
     # decompress_full — main C++ bridge entry point
     # ------------------------------------------------------------------
 
-    def decompress_full(self, frame_or_openzl_payload: bytes, orig_size: int = 0) -> bytes:
+    def decompress_full(self, frame: bytes, orig_size: int = 0) -> bytes:
         """
         Decompress a K2 frame.
 
-        For ZSTD/ZLIB backends: pass the raw K2 frame bytes.
-          Python handles all decompression.
-
-        For OPENZL backend: C++ has already called DCtx::decompressSerial()
-          and passes the resulting bytes here (which still contain the K2
-          frame header + txhdr + now-decompressed payload).
-          `orig_size` must be provided so we can bound zlib decompression.
+        C++ has already called asdp_decompress() on the payload and resealed
+        the frame before calling here.  This function only inverts the
+        structural transforms.
 
         Returns original bytes.
         """
         try:
-            backend, stored_orig, txhdr_bytes, payload = decode_k2_frame(
-                frame_or_openzl_payload
-            )
+            backend, stored_orig, txhdr_bytes, payload = decode_k2_frame(frame)
         except ValueError:
             # No K2 frame header — legacy raw path, return as-is
-            return frame_or_openzl_payload
+            return frame
 
-        actual_orig = stored_orig or orig_size
+        if backend != _BACKEND_ASDP:
+            raise ValueError(f"unsupported backend: {backend:#04x}")
 
-        # Entropy decompress
-        if backend in (_BACKEND_OPENZL, _BACKEND_ASDP):
-            # payload is already entropy-decoded by C++ (ASDP); use as-is
-            transformed = payload
-        else:
-            transformed = _entropy_decompress(
-                payload, max_length=max(actual_orig * 2, 1 << 20)
-            )
-
-        # Inverse transforms
+        # payload is already entropy-decoded by C++ asdp_decompress; invert transforms.
         if len(txhdr_bytes) >= 5:
             try:
                 ops, _ = _decode_txhdr(txhdr_bytes)
-                return _apply_inv_chain(transformed, ops)
+                return _apply_inv_chain(payload, ops)
             except ValueError:
                 pass
-        return transformed
+        return payload
 
     # ------------------------------------------------------------------
     # Legacy compress/decompress (no-OpenZL path, used by direct tests)
@@ -819,21 +740,14 @@ class K2Pipeline:
     def stats(self) -> dict:
         if self._optimizer is None:
             return {}
-        backend_name = {
-            _BACKEND_OPENZL: "openzl",
-            _BACKEND_ZSTD:   "zstd",
-            _BACKEND_ZLIB:   "zlib",
-            _BACKEND_ASDP:   "asdp",
-        }.get(self._active_backend, "unknown")
         return {
-            "hint":             str(self._hint.data_class.name) if self._hint else None,
-            "recent_ratio":     round(self._optimizer.recent_ratio(), 3),
-            "throughput_mbs":   round(self._optimizer.recent_throughput_mbs(), 1),
-            "strategies":       self._optimizer.stats(),
-            "best_strategy":    self._optimizer.best_strategy().name,
-            "active_strategy":  self._active_strategy,
-            "active_backend":   backend_name,
-            "zstd_available":   _ZSTD_AVAILABLE,
+            "hint":              str(self._hint.data_class.name) if self._hint else None,
+            "recent_ratio":      round(self._optimizer.recent_ratio(), 3),
+            "throughput_mbs":    round(self._optimizer.recent_throughput_mbs(), 1),
+            "strategies":        self._optimizer.stats(),
+            "best_strategy":     self._optimizer.best_strategy().name,
+            "active_strategy":   self._active_strategy,
+            "active_backend":    "asdp",
             "active_transforms": [
                 {"op": hex(op), "param": param}
                 for op, param in self._active_ops
