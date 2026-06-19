@@ -4,6 +4,9 @@ openzl/
 # Silesia
 silesia/
 
+# ASDP-LH (fix later)
+asdp-lh/
+
 # Build artifacts
 build/
 cmake-build-*/

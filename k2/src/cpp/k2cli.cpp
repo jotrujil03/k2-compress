@@ -13,6 +13,7 @@
  * Use k2cli decompress to restore; zli decompress is not compatible.
  */
 
+#include <atomic>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -20,9 +21,10 @@
 #include <iomanip>
 #include <iostream>
 #include <string>
+#include <thread>
 #include <vector>
 
-#include "k2_bridge.h"
+#include "k2_bridge.h"   // pulls in asdp/asdp.h for asdp_compress_bound()
 
 static std::vector<uint8_t> read_file(const std::string& path) {
     std::ifstream f(path, std::ios::binary | std::ios::ate);
@@ -53,6 +55,7 @@ static void usage() {
         "  k2cli compress   <input> <output.k2>\n"
         "  k2cli decompress <input.k2> <output>\n"
         "  k2cli roundtrip  <input>\n"
+        "  k2cli parallel   <input> <n_threads>\n"
         "  k2cli stats      <input>\n"
         "\n"
         "Environment:\n"
@@ -63,11 +66,10 @@ static void usage() {
     std::exit(1);
 }
 
-// Output buffer bound: K2 frame overhead (≤128 bytes) + worst-case entropy
-// expansion (incompressible data ≈ 1.001× input).  ZL_compressBound is still
-// available and is always >= input size, so it remains a safe upper bound.
+// Output buffer bound: ASDP guarantees the entropy backend never exceeds
+// asdp_compress_bound(n); add K2 frame + txhdr overhead headroom.
 static size_t output_bound(size_t input_size) {
-    return ZL_compressBound(input_size) + 256;
+    return asdp_compress_bound(input_size) + 256;
 }
 
 static int cmd_compress(const std::string& in_path, const std::string& out_path) {
@@ -168,12 +170,70 @@ static int cmd_stats(const std::string& in_path) {
     return 0;
 }
 
+// ---------------------------------------------------------------------------
+// Parallel roundtrip — exercises the shared-handle threading model (fix C).
+//
+// Correct pattern: create ONE K2Handle on the main thread, prepare it, then
+// share it across worker threads.  Each worker calls k2_compress/k2_decompress
+// on the same handle.  This is safe because:
+//   - the interpreter is initialised once with the GIL released at rest
+//     (k2_bridge.cpp), so no worker deadlocks acquiring the GIL;
+//   - the Python pipeline calls serialise briefly on the GIL, while the heavy
+//     ASDP entropy work runs GIL-free, giving real parallel throughput.
+//
+// Anti-pattern (the original deadlock): each worker calling k2_create() →
+// concurrent Py_Initialize() with the GIL held by the first thread.
+// ---------------------------------------------------------------------------
+static int cmd_parallel(const std::string& in_path, int n_threads) {
+    auto original = read_file(in_path);
+    std::cout << "K2 parallel roundtrip: " << in_path << " ("
+              << original.size() << " bytes) x" << n_threads << " threads\n";
+
+    K2Handle* h = make_handle();                       // ONE shared handle
+    size_t sample_len = std::min(original.size(), size_t(65536));
+    k2_prepare(h, original.data(), sample_len);
+
+    std::atomic<int> failures{0};
+    auto worker = [&](int tid) {
+        std::vector<uint8_t> comp(output_bound(original.size()));
+        size_t comp_len = 0;
+        if (k2_compress(h, original.data(), original.size(),
+                        comp.data(), comp.size(), &comp_len) != 0) {
+            ++failures; return;
+        }
+        std::vector<uint8_t> rest(original.size() * 2 + 4096);
+        size_t rest_len = 0;
+        if (k2_decompress(h, comp.data(), comp_len,
+                          rest.data(), rest.size(), &rest_len) != 0) {
+            ++failures; return;
+        }
+        if (rest_len != original.size() ||
+            std::memcmp(rest.data(), original.data(), rest_len) != 0) {
+            ++failures;
+            std::cerr << "  thread " << tid << ": MISMATCH\n";
+        }
+    };
+
+    std::vector<std::thread> pool;
+    for (int t = 0; t < n_threads; ++t) pool.emplace_back(worker, t);
+    for (auto& th : pool) th.join();
+
+    const int f = failures.load();
+    if (f == 0) std::cout << "  \xe2\x9c\x93 all " << n_threads << " threads verified\n";
+    else        std::cerr << "  \xe2\x9c\x97 " << f << " thread(s) failed\n";
+
+    std::cout << k2_stats(h) << "\n";
+    k2_destroy(h);
+    return f == 0 ? 0 : 1;
+}
+
 int main(int argc, char* argv[]) {
     if (argc < 2) usage();
     std::string cmd = argv[1];
     if (cmd == "compress"   && argc == 4) return cmd_compress(argv[2], argv[3]);
     if (cmd == "decompress" && argc == 4) return cmd_decompress(argv[2], argv[3]);
     if (cmd == "roundtrip"  && argc == 3) return cmd_roundtrip(argv[2]);
+    if (cmd == "parallel"   && argc == 4) return cmd_parallel(argv[2], std::atoi(argv[3]));
     if (cmd == "stats"      && argc == 3) return cmd_stats(argv[2]);
     usage(); return 1;
 }

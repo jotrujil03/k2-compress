@@ -11,8 +11,7 @@
 #include <string>
 #include <vector>
 
-#include "openzl/zl_compress.h"
-#include "k2_bridge.h"
+#include "k2_bridge.h"   // pulls in asdp/asdp.h for asdp_compress_bound()
 
 static int g_passed = 0;
 static int g_failed = 0;
@@ -43,8 +42,8 @@ static std::vector<uint8_t> make_text(size_t n = 8192) {
 }
 
 // Output buffer large enough for any backend.
-// ZL_compressBound >= input_size, plus K2 frame overhead.
-static size_t output_bound(size_t n) { return ZL_compressBound(n) + 256; }
+// asdp_compress_bound >= input_size, plus K2 frame overhead.
+static size_t output_bound(size_t n) { return asdp_compress_bound(n) + 256; }
 
 // ---------------------------------------------------------------------------
 

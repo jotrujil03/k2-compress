@@ -3,16 +3,21 @@
  *
  * C++ Bridge: K2 Neural Pipeline
  * --------------------------------
- * K2Pipeline owns the full compression decision.  The C++ bridge:
+ * K2Pipeline (Python) owns the full compression decision.  The C++ bridge:
  *   - For zstd/zlib backends: passes K2 frames through unchanged.
- *   - For OpenZL backend:     calls CCtx::compressSerial on the payload,
- *                             then calls reseal_openzl_frame() to embed
- *                             the result back into the K2 frame.
+ *   - For the ASDP backend:   calls asdp_compress() on the (pre-transform)
+ *                             payload, then reseals the K2 frame around the
+ *                             ASDP output.  On decompress it calls
+ *                             asdp_decompress() first, reseals, then lets
+ *                             Python invert the structural transforms.
+ *
+ * OpenZL has been removed (fix D).  The structured-data entropy backend is now
+ * ASDP-LH (fix E); text/binary continue to route to zstd in Python.
  *
  * K2 Frame Format (owned by Python, parsed by C++ for dispatch only):
  *   [0..3]   magic  b'K2\xf7\x01'
  *   [4]      version  0x01
- *   [5]      backend  0x01=OpenZL  0x02=zstd  0x03=zlib
+ *   [5]      backend  0x02=zstd  0x03=zlib  0x04=ASDP   (0x01 OpenZL retired)
  *   [6]      flags
  *   [7]      reserved
  *   [8..15]  orig_size  uint64 LE
@@ -20,19 +25,19 @@
  *   [18..]   txhdr + payload
  *
  * Compress path:
- *   compress_full(data) → K2 frame
- *   if backend == OPENZL:
- *     payload = CCtx::compressSerial(frame.payload)
- *     frame   = reseal_openzl_frame(frame, payload)
+ *   compress_full(data) -> K2 frame
+ *   if backend == ASDP:
+ *     payload = asdp_compress(frame.payload)     // GIL released here
+ *     frame   = reseal_frame(frame, payload)
  *   return frame
  *
  * Decompress path:
- *   if backend == OPENZL:
- *     inner = DCtx::decompressSerial(frame.payload)
- *     reseal frame with decompressed inner as payload
- *     decompress_full(resealed_frame) → original bytes
+ *   if backend == ASDP:
+ *     inner = asdp_decompress(frame.payload)      // GIL released here
+ *     resealed = reseal_frame(frame, inner)
+ *     decompress_full(resealed) -> original bytes // Python inverts transforms
  *   else:
- *     decompress_full(frame) → original bytes  (Python does entropy)
+ *     decompress_full(frame) -> original bytes     (Python does entropy)
  */
 
 #pragma once
@@ -68,7 +73,7 @@ K2_API int k2_prepare(
     size_t         sample_len
 );
 
-/** Compress src → K2 frame in dst. */
+/** Compress src -> K2 frame in dst. */
 K2_API int k2_compress(
     K2Handle*      handle,
     const uint8_t* src,
@@ -115,13 +120,7 @@ K2_API void        k2_destroy(K2Handle* handle);
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
 
-#include "openzl/cpp/CCtx.hpp"
-#include "openzl/cpp/Compressor.hpp"
-#include "openzl/cpp/DCtx.hpp"
-#include "openzl/zl_compress.h"
-#include "openzl/zl_decompress.h"
-#include "openzl/codecs/zl_segmenters.h"
-#include "openzl/zl_graphs.h"
+#include "asdp/asdp.h"   // ASDP-LH C API (replaces OpenZL)
 
 namespace py = pybind11;
 using namespace pybind11::literals;
@@ -136,9 +135,10 @@ static constexpr uint8_t  K2_FRAME_MAGIC[4] = {
     uint8_t('K'), uint8_t('2'), uint8_t(0xf7), uint8_t(0x01)
 };
 static constexpr uint8_t  K2_FRAME_VERSION  = 0x01;
-static constexpr uint8_t  K2_BACKEND_OPENZL = 0x01;
+static constexpr uint8_t  K2_BACKEND_OPENZL = 0x01;  // retired; kept for decode guard
 static constexpr uint8_t  K2_BACKEND_ZSTD   = 0x02;
 static constexpr uint8_t  K2_BACKEND_ZLIB   = 0x03;
+static constexpr uint8_t  K2_BACKEND_ASDP   = 0x04;
 static constexpr size_t   K2_FRAME_HDR_SIZE = 18;  // through txhdr_len field
 
 struct K2FrameHeader {
@@ -180,21 +180,6 @@ static size_t frame_payload_offset(const uint8_t* data, size_t len) {
 
 
 // ---------------------------------------------------------------------------
-// OpenZL serial compressor (built once, reused)
-// ---------------------------------------------------------------------------
-
-inline openzl::Compressor make_serial_compressor() {
-    openzl::Compressor comp;
-    ZL_GraphID inner = ZL_Compressor_buildACEGraphWithDefault(
-        comp.get(), ZL_GRAPH_LZ);
-    ZL_GraphID graph = ZL_Compressor_buildSerialSegmenter(
-        comp.get(), ZL_DEFAULT_SEGMENTER_CHUNK_BYTE_SIZE, inner);
-    comp.selectStartingGraph(graph);
-    return comp;
-}
-
-
-// ---------------------------------------------------------------------------
 // Bridge
 // ---------------------------------------------------------------------------
 
@@ -204,8 +189,9 @@ public:
         const std::string& python_module_dir,
         const std::string& onnx_model_path = "",
         double exploration    = 1.0,
-        double latency_weight = 0.15
-    ) : _compressor(make_serial_compressor())
+        double latency_weight = 0.15,
+        int    asdp_level     = 3
+    ) : _asdp_level(asdp_level)
     {
         py::gil_scoped_acquire gil;
         py::module_ sys = py::module_::import("sys");
@@ -221,6 +207,13 @@ public:
         );
     }
 
+    // _pipeline is a py::object; its decref needs the GIL, which is released
+    // at rest (see k2_bridge.cpp).  Reacquire before destroying it.
+    ~Bridge() {
+        py::gil_scoped_acquire gil;
+        _pipeline = py::object();
+    }
+
     std::string prepare(const uint8_t* data, size_t len) {
         py::gil_scoped_acquire gil;
         py::bytes sample(reinterpret_cast<const char*>(data), len);
@@ -229,36 +222,34 @@ public:
     }
 
     /**
-     * Compress data → K2 frame.
+     * Compress data -> K2 frame.
      *
-     * 1. Call Python compress_full(data) → K2 frame bytes.
+     * 1. Call Python compress_full(data) -> K2 frame bytes.
      * 2. Inspect backend byte:
      *    - ZSTD/ZLIB: frame is complete, return as-is.
-     *    - OPENZL: extract payload (pre-transform bytes), run CCtx,
-     *              call Python reseal_openzl_frame(frame, cctx_output).
+     *    - ASDP: extract payload (pre-transform bytes), run asdp_compress()
+     *            with the GIL released, then call Python reseal_frame().
      */
     std::vector<uint8_t> compress(const uint8_t* data, size_t len) {
         auto t0 = std::chrono::steady_clock::now();
 
-        // Step 1: Python decides backend + transforms, returns K2 frame
+        // Step 1: Python decides backend + transforms, returns K2 frame.
         std::vector<uint8_t> frame = call_compress_full(data, len);
 
         uint8_t backend = frame_backend(frame.data(), frame.size());
 
-        if (backend == K2_BACKEND_OPENZL) {
-            // Step 2a: entropy-compress the payload with OpenZL
-            size_t poff  = frame_payload_offset(frame.data(), frame.size());
-            std::string src(
-                reinterpret_cast<const char*>(frame.data() + poff),
-                frame.size() - poff);
+        if (backend == K2_BACKEND_ASDP) {
+            // Step 2a: entropy-compress the payload with ASDP-LH.
+            // call_compress_full() has already released the GIL, so this
+            // pure-C++ work runs concurrently across worker threads.
+            const size_t poff   = frame_payload_offset(frame.data(), frame.size());
+            const uint8_t* pl   = frame.data() + poff;
+            const size_t   plen = frame.size() - poff;
 
-            openzl::CCtx cctx;
-            cctx.setParameter(openzl::CParam::FormatVersion, ZL_MAX_FORMAT_VERSION);
-            cctx.refCompressor(_compressor);
-            std::string openzl_out = cctx.compressSerial(src);
+            std::string asdp_out = asdp_compress_payload(pl, plen);
 
-            // Step 2b: reseal frame with compressed payload
-            frame = call_reseal_openzl_frame(frame, openzl_out);
+            // Step 2b: reseal frame with the compressed payload.
+            frame = call_reseal_frame(frame, asdp_out);
         }
         // For ZSTD/ZLIB backends frame is already final — nothing to do.
 
@@ -270,35 +261,29 @@ public:
     }
 
     /**
-     * Decompress a K2 frame → original bytes.
-     *
-     * 1. Inspect backend:
-     *    - ZSTD/ZLIB: call Python decompress_full(frame) directly.
-     *    - OPENZL: extract payload, run DCtx, reseal frame with
-     *              decompressed payload, call Python decompress_full(resealed).
+     * Decompress a K2 frame -> original bytes.
      */
     std::vector<uint8_t> decompress(const uint8_t* data, size_t len) {
         uint8_t backend = frame_backend(data, len);
 
-        if (backend == K2_BACKEND_OPENZL) {
-            // Step 1: OpenZL entropy decompress
-            size_t poff = frame_payload_offset(data, len);
-            std::string src(
-                reinterpret_cast<const char*>(data + poff),
-                len - poff);
-            openzl::DCtx dctx;
-            std::string inner = dctx.decompressSerial(src);
+        if (backend == K2_BACKEND_ASDP) {
+            // Step 1: ASDP entropy decompress (GIL-free).
+            const size_t poff   = frame_payload_offset(data, len);
+            const uint8_t* pl   = data + poff;
+            const size_t   plen = len - poff;
 
-            // Step 2: reseal frame with decompressed payload
-            std::vector<uint8_t> resealed = call_reseal_openzl_frame(
+            std::string inner = asdp_decompress_payload(pl, plen);
+
+            // Step 2: reseal frame with decompressed payload.
+            std::vector<uint8_t> resealed = call_reseal_frame(
                 std::vector<uint8_t>(data, data + len), inner);
 
-            // Step 3: Python handles transform inversion
+            // Step 3: Python inverts the structural transforms.
             return call_decompress_full(resealed.data(), resealed.size(),
                                         frame_orig_size(data, len));
         }
 
-        // ZSTD/ZLIB: Python does everything
+        // ZSTD/ZLIB: Python does everything.
         return call_decompress_full(data, len, frame_orig_size(data, len));
     }
 
@@ -331,8 +316,51 @@ public:
     }
 
 private:
-    py::object          _pipeline;
-    openzl::Compressor  _compressor;
+    py::object _pipeline;
+    int        _asdp_level;
+
+    // ------------------------------------------------------------------
+    // ASDP entropy backend (pure C++, no GIL).  A context is created per
+    // call: asdp_ctx_t is not thread-safe, and a shared Bridge may be driven
+    // from multiple threads, so per-call contexts avoid any shared state.
+    // ------------------------------------------------------------------
+
+    std::string asdp_compress_payload(const uint8_t* pl, size_t plen) {
+        asdp_config_t cfg = asdp_default_config();
+        cfg.level = _asdp_level;
+        asdp_ctx_t* ctx = asdp_create(&cfg);
+        if (!ctx) throw std::runtime_error("asdp_create failed");
+
+        const size_t bound = asdp_compress_bound(plen);
+        std::vector<uint8_t> out(bound);
+        size_t out_len = 0;
+        const int rc = asdp_compress(ctx, pl, plen, out.data(), bound, &out_len);
+        asdp_destroy(ctx);
+        if (rc != ASDP_OK)
+            throw std::runtime_error(std::string("asdp_compress: ") + asdp_error_str(rc));
+        return std::string(reinterpret_cast<char*>(out.data()), out_len);
+    }
+
+    std::string asdp_decompress_payload(const uint8_t* pl, size_t plen) {
+        const uint64_t orig = asdp_frame_orig_size(pl, plen);
+        asdp_config_t cfg = asdp_default_config();
+        cfg.level = _asdp_level;
+        asdp_ctx_t* ctx = asdp_create(&cfg);
+        if (!ctx) throw std::runtime_error("asdp_create failed");
+
+        std::vector<uint8_t> out(orig ? orig : plen * 4 + 4096);
+        size_t out_len = 0;
+        const int rc = asdp_decompress(ctx, pl, plen,
+                                       out.data(), out.size(), &out_len);
+        asdp_destroy(ctx);
+        if (rc != ASDP_OK)
+            throw std::runtime_error(std::string("asdp_decompress: ") + asdp_error_str(rc));
+        return std::string(reinterpret_cast<char*>(out.data()), out_len);
+    }
+
+    // ------------------------------------------------------------------
+    // Python call helpers (each acquires the GIL for its scope only)
+    // ------------------------------------------------------------------
 
     std::vector<uint8_t> call_compress_full(const uint8_t* data, size_t len) {
         py::gil_scoped_acquire gil;
@@ -344,13 +372,12 @@ private:
         } catch (const py::error_already_set& e) {
             fprintf(stderr, "k2_bridge: compress_full failed: %s\n", e.what());
             PyErr_Clear();
-            // Fallback: return raw bytes wrapped in a minimal zlib frame
-            // (Python side will handle on decompress)
+            // Fallback: return raw bytes (decompress side handles legacy path).
             return std::vector<uint8_t>(data, data + len);
         }
     }
 
-    std::vector<uint8_t> call_reseal_openzl_frame(
+    std::vector<uint8_t> call_reseal_frame(
         const std::vector<uint8_t>& frame,
         const std::string& new_payload)
     {
@@ -358,11 +385,11 @@ private:
         py::bytes py_frame(reinterpret_cast<const char*>(frame.data()), frame.size());
         py::bytes py_payload(new_payload.data(), new_payload.size());
         try {
-            py::bytes out = _pipeline.attr("reseal_openzl_frame")(py_frame, py_payload);
+            py::bytes out = _pipeline.attr("reseal_frame")(py_frame, py_payload);
             std::string s = out.cast<std::string>();
             return std::vector<uint8_t>(s.begin(), s.end());
         } catch (const py::error_already_set& e) {
-            fprintf(stderr, "k2_bridge: reseal_openzl_frame failed: %s\n", e.what());
+            fprintf(stderr, "k2_bridge: reseal_frame failed: %s\n", e.what());
             PyErr_Clear();
             return frame;
         }

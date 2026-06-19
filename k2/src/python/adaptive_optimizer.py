@@ -19,7 +19,7 @@ K2 Frame Format
 Offset  Size  Field
 0       4     magic  b'K2\\xf7\\x01'
 4       1     version  0x01
-5       1     backend  0x01=OpenZL  0x02=zstd  0x03=zlib-fallback
+5       1     backend  0x02=zstd  0x03=zlib-fallback  0x04=ASDP  (0x01 OpenZL retired)
 6       1     flags    bit0=transforms_applied  rest reserved
 7       1     reserved 0x00
 8       8     orig_size  uint64 LE
@@ -28,10 +28,10 @@ Offset  Size  Field
 18+N    ...   backend payload
 
 The C++ bridge reads the frame, and:
-  - backend=OpenZL → calls CCtx::compressSerial(payload), replaces payload,
-                     re-seals frame.  On decompress: DCtx then K2 inv.
+  - backend=ASDP   → calls asdp_compress(payload), replaces payload,
+                     re-seals frame.  On decompress: asdp_decompress then K2 inv.
   - backend=zstd   → payload is already a complete zstd frame.
-                     No CCtx call.  On decompress: zstd_decompress then K2 inv.
+                     No ASDP call.  On decompress: zstd_decompress then K2 inv.
   - backend=zlib   → same as zstd but zlib (fallback when zstandard absent).
 """
 
@@ -68,9 +68,10 @@ except ImportError:
 
 _FRAME_MAGIC      = b"K2\xf7\x01"
 _FRAME_VERSION    = 0x01
-_BACKEND_OPENZL   = 0x01
+_BACKEND_OPENZL   = 0x01   # retired — OpenZL removed; kept for legacy decode only
 _BACKEND_ZSTD     = 0x02
 _BACKEND_ZLIB     = 0x03   # fallback when zstandard not installed
+_BACKEND_ASDP     = 0x04   # ASDP-LH entropy backend (C++ bridge runs it)
 _FLAG_TRANSFORMS  = 0x01
 _FRAME_HDR_STRUCT = struct.Struct("<4sBBBBQH")   # 18 bytes
 _FRAME_HDR_SIZE   = _FRAME_HDR_STRUCT.size       # 18
@@ -197,20 +198,20 @@ def _default_strategies_for(hint: StructureHint) -> list[Strategy]:
     if cls == DataClass.TIMESERIES:
         strategies += [
             Strategy("ts_delta_zigzag", PredictorMode.LINEAR_CMA, 0.3, 4096, 3,
-                     [f"bytedelta-{w}", "zigzag"], _BACKEND_OPENZL),
+                     [f"bytedelta-{w}", "zigzag"], _BACKEND_ASDP),
             Strategy("ts_delta_only",   PredictorMode.LINEAR_CMA, 0.3, 4096, 3,
-                     [f"bytedelta-{w}"], _BACKEND_OPENZL),
+                     [f"bytedelta-{w}"], _BACKEND_ASDP),
             Strategy("ts_raw",          PredictorMode.PASSTHROUGH, 0.0, 4096, 3,
-                     [], _BACKEND_OPENZL),
+                     [], _BACKEND_ASDP),
         ]
     elif cls == DataClass.INTEGER_ARRAY:
         strategies += [
             Strategy("int_delta",        PredictorMode.LINEAR_CMA, 0.3, 4096, 3,
-                     [f"bytedelta-{w}"], _BACKEND_OPENZL),
+                     [f"bytedelta-{w}"], _BACKEND_ASDP),
             Strategy("int_delta_zigzag", PredictorMode.LINEAR_CMA, 0.3, 4096, 3,
-                     [f"bytedelta-{w}", "zigzag"], _BACKEND_OPENZL),
+                     [f"bytedelta-{w}", "zigzag"], _BACKEND_ASDP),
             Strategy("int_raw",          PredictorMode.PASSTHROUGH, 0.0, 4096, 3,
-                     [], _BACKEND_OPENZL),
+                     [], _BACKEND_ASDP),
         ]
     elif cls == DataClass.FLOAT_ARRAY:
         eb = _best_entropy_backend()
@@ -665,9 +666,10 @@ class K2Pipeline:
         # Apply structural transforms
         transformed = _apply_chain(data, self._active_ops)
 
-        if self._active_backend == _BACKEND_OPENZL:
-            # C++ will run CCtx; we return the pre-transform payload.
-            # The C++ bridge calls reseal_openzl_frame() after CCtx returns.
+        if self._active_backend in (_BACKEND_OPENZL, _BACKEND_ASDP):
+            # C++ will run the entropy backend (ASDP); we return the
+            # pre-transform payload.  The C++ bridge calls reseal_frame()
+            # after asdp_compress() returns.
             payload = transformed
         else:
             # Run entropy compression in Python.
@@ -687,26 +689,30 @@ class K2Pipeline:
         )
 
     # ------------------------------------------------------------------
-    # reseal_openzl_frame — called by C++ after CCtx returns
+    # reseal_frame — called by C++ after the entropy backend (ASDP) returns
     # ------------------------------------------------------------------
 
-    def reseal_openzl_frame(self, frame: bytes, openzl_payload: bytes) -> bytes:
+    def reseal_frame(self, frame: bytes, entropy_payload: bytes) -> bytes:
         """
-        Replace the payload in an OPENZL-backend K2 frame with the output
-        of CCtx::compressSerial().  Called by the C++ bridge.
-        Also records the real compressed size for the bandit.
+        Replace the payload in an entropy-backend (ASDP) K2 frame with the
+        output of asdp_compress().  Called by the C++ bridge.  Backend byte and
+        txhdr are preserved; also records the real compressed size for the bandit.
         """
         backend, orig_size, txhdr, _ = decode_k2_frame(frame)
-        sealed = encode_k2_frame(backend, orig_size, txhdr, openzl_payload)
+        sealed = encode_k2_frame(backend, orig_size, txhdr, entropy_payload)
         # Record with real size
         strat = self._optimizer._strategies.get(self._active_strategy) if self._optimizer else None
         if strat:
-            ratio_score = math.log2(max(orig_size / max(len(openzl_payload), 1), 1.0))
+            ratio_score = math.log2(max(orig_size / max(len(entropy_payload), 1), 1.0))
             strat._n_plays     += 1
             strat._total_score += ratio_score
             if self._optimizer:
                 self._optimizer._total_plays += 1
         return sealed
+
+    # Backward-compat alias (older C++ bridges called this name).
+    def reseal_openzl_frame(self, frame: bytes, openzl_payload: bytes) -> bytes:
+        return self.reseal_frame(frame, openzl_payload)
 
     # ------------------------------------------------------------------
     # update_final_score — C API feedback
@@ -758,8 +764,8 @@ class K2Pipeline:
         actual_orig = stored_orig or orig_size
 
         # Entropy decompress
-        if backend == _BACKEND_OPENZL:
-            # payload is already entropy-decoded by C++ DCtx; use as-is
+        if backend in (_BACKEND_OPENZL, _BACKEND_ASDP):
+            # payload is already entropy-decoded by C++ (ASDP); use as-is
             transformed = payload
         else:
             transformed = _entropy_decompress(
@@ -817,6 +823,7 @@ class K2Pipeline:
             _BACKEND_OPENZL: "openzl",
             _BACKEND_ZSTD:   "zstd",
             _BACKEND_ZLIB:   "zlib",
+            _BACKEND_ASDP:   "asdp",
         }.get(self._active_backend, "unknown")
         return {
             "hint":             str(self._hint.data_class.name) if self._hint else None,

@@ -123,8 +123,7 @@ add_executable(k2cli
 
 target_include_directories(k2cli PRIVATE
     ${K2_ROOT}/include
-    ${OPENZL_ROOT}/cpp/include
-    ${OPENZL_ROOT}/include
+    ${ASDP_ROOT}/include
 )
 target_link_libraries(k2cli 
     PRIVATE 
@@ -151,8 +150,7 @@ if(K2_BUILD_TESTS)
 
     target_include_directories(k2_test PRIVATE
         ${K2_ROOT}/include
-        ${OPENZL_ROOT}/cpp/include
-        ${OPENZL_ROOT}/include
+        ${ASDP_ROOT}/include
     )
     target_link_libraries(k2_test 
         PRIVATE 
@@ -193,7 +191,7 @@ install(DIRECTORY src/python/
 message(STATUS "")
 message(STATUS "K2 configuration:")
 message(STATUS "  Version      : ${PROJECT_VERSION}")
-message(STATUS "  OpenZL root  : ${OPENZL_ROOT}")
+message(STATUS "  ASDP root    : ${ASDP_ROOT}")
 message(STATUS "  Python dir   : ${K2_PY_DIR}")
 message(STATUS "  Python       : ${Python3_VERSION} (${Python3_EXECUTABLE})")
 message(STATUS "  pybind11     : ${pybind11_VERSION}")
