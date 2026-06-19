@@ -190,7 +190,7 @@ public:
         const std::string& onnx_model_path = "",
         double exploration    = 1.0,
         double latency_weight = 0.15,
-        int    asdp_level     = 3
+        int    asdp_level     = 4
     ) : _asdp_level(asdp_level)
     {
         py::gil_scoped_acquire gil;
