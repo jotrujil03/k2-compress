@@ -9,6 +9,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cerrno>
 #include <chrono>
 #include <cstring>
 #include <filesystem>
@@ -356,7 +357,14 @@ private:
 
     bool write_raw(const uint8_t* p, size_t n, std::string* err) {
         _f.write(reinterpret_cast<const char*>(p), std::streamsize(n));
-        if (!_f) { if (err) *err = "write failed to " + volume_name(_volume_index); return false; }
+        if (!_f) {
+            if (err) {
+                *err = "write failed to " + volume_name(_volume_index) +
+                       " (" + std::strerror(errno) + ") -- check available disk "
+                       "space at that location";
+            }
+            return false;
+        }
         return true;
     }
 };

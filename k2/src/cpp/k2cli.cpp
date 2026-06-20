@@ -13,7 +13,9 @@
  * Use k2cli decompress to restore; zli decompress is not compatible.
  */
 
+#include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -61,7 +63,7 @@ static void usage() {
         "                                              auto multi-volume if large)\n"
         "  k2cli decompress <input.k2> <output>      (.k2 -> file)\n"
         "  k2cli decompress <archive> <output_dir>   (.k2a[.NNN] -> directory)\n"
-        "  k2cli roundtrip  <input>\n"
+        "  k2cli roundtrip  <input>                  (file or directory)\n"
         "  k2cli parallel   <input> <n_threads>\n"
         "  k2cli stats      <input>\n"
         "\n"
@@ -166,7 +168,125 @@ static int cmd_decompress(const std::string& in_path, const std::string& out_pat
     return 0;
 }
 
+// Recursively compares two directory trees: same relative paths (files and
+// empty dirs) and byte-identical file contents. Returns true on match;
+// on mismatch, writes a short description to *detail.
+static bool trees_match(const fs::path& a, const fs::path& b, std::string* detail) {
+    std::vector<fs::path> rel_a, rel_b;
+    std::error_code ec;
+    for (auto& e : fs::recursive_directory_iterator(a, ec))
+        rel_a.push_back(fs::relative(e.path(), a));
+    for (auto& e : fs::recursive_directory_iterator(b, ec))
+        rel_b.push_back(fs::relative(e.path(), b));
+    std::sort(rel_a.begin(), rel_a.end());
+    std::sort(rel_b.begin(), rel_b.end());
+    if (rel_a != rel_b) {
+        if (detail) *detail = "directory structure differs (file/dir set mismatch)";
+        return false;
+    }
+    for (auto& rp : rel_a) {
+        fs::path pa = a / rp, pb = b / rp;
+        if (fs::is_directory(pa, ec)) continue;
+        auto fa = read_file(pa.string());
+        auto fb = read_file(pb.string());
+        if (fa != fb) {
+            if (detail) *detail = "content mismatch: " + rp.string();
+            return false;
+        }
+    }
+    return true;
+}
+
+static int cmd_roundtrip_archive(const std::string& in_dir) {
+    std::error_code ec;
+    uint64_t src_bytes = 0;
+    for (auto& e : fs::recursive_directory_iterator(in_dir, ec))
+        if (fs::is_regular_file(e, ec)) src_bytes += fs::file_size(e, ec);
+    std::cout << "K2 archive roundtrip: " << in_dir << " (" << src_bytes << " bytes)\n";
+
+    // Use a sibling of the input directory, not fs::temp_directory_path().
+    // /tmp is frequently tmpfs (RAM-backed) or a small dedicated partition
+    // with far less room than the filesystem actually holding the source
+    // data — for large inputs (multi-GB+) that risks a mid-run write
+    // failure. The archive + restored copy together need roughly
+    // src_bytes (compressed output) + src_bytes (restored copy) of
+    // headroom in the worst case (no compression at all); check for that
+    // up front rather than discovering it after a long compression pass.
+    fs::path in_path(in_dir);
+    fs::path parent = fs::absolute(in_path, ec).parent_path();
+    fs::path tmp_root = parent /
+        ("." + in_path.filename().string() + "_k2cli_roundtrip_" +
+         std::to_string(uint64_t(std::chrono::steady_clock::now()
+             .time_since_epoch().count())));
+
+    const auto space = fs::space(parent, ec);
+    if (!ec) {
+        const uint64_t needed = src_bytes * 2;   // archive + restored copy, worst case
+        if (space.available < needed) {
+            std::cerr << "  refusing to start: " << parent.string() << " has "
+                      << (space.available / (1024 * 1024)) << " MB free, need roughly "
+                      << (needed / (1024 * 1024)) << " MB (archive + restored copy, "
+                      << "worst case no compression). Free up space or pass a smaller "
+                      << "input.\n";
+            return 1;
+        }
+    }
+    fs::create_directories(tmp_root, ec);
+
+    fs::path archive_base = tmp_root / "archive";
+    fs::path out_dir = tmp_root / "restored";
+
+    k2a::ArchiveConfig cfg;
+    std::string err;
+    auto rc = k2a::pack_directory(in_dir, archive_base.string(), cfg, &err);
+    if (rc != k2a::ArchiveError::ok) {
+        std::cerr << "  pack failed: " << k2a::archive_error_str(rc);
+        if (!err.empty()) std::cerr << " (" << err << ")";
+        std::cerr << "\n";
+        fs::remove_all(tmp_root, ec);
+        return 1;
+    }
+
+    uint64_t archive_bytes = 0;
+    int n_volumes = 0;
+    for (int i = 1; ; ++i) {
+        char suffix[16]; std::snprintf(suffix, sizeof(suffix), ".%03d", i);
+        fs::path vp = archive_base.string() + suffix;
+        if (!fs::exists(vp, ec)) break;
+        archive_bytes += fs::file_size(vp, ec);
+        ++n_volumes;
+    }
+    const double ratio = archive_bytes ? double(src_bytes) / double(archive_bytes) : 0.0;
+    std::cout << "  compressed: " << archive_bytes << " bytes across " << n_volumes
+              << " volume(s) (" << std::fixed << std::setprecision(2) << ratio << "x)\n";
+
+    rc = k2a::unpack_archive(archive_base.string(), out_dir.string(), cfg, &err);
+    if (rc != k2a::ArchiveError::ok) {
+        std::cerr << "  unpack failed: " << k2a::archive_error_str(rc);
+        if (!err.empty()) std::cerr << " (" << err << ")";
+        std::cerr << "\n";
+        fs::remove_all(tmp_root, ec);
+        return 1;
+    }
+
+    std::string mismatch;
+    const bool ok = trees_match(in_dir, out_dir, &mismatch);
+    fs::remove_all(tmp_root, ec);   // clean up the temp archive + restored copy either way
+
+    if (ok) {
+        std::cout << "  \xe2\x9c\x93 MATCH \xe2\x80\x94 roundtrip verified (" << src_bytes << " bytes)\n";
+        return 0;
+    }
+    std::cerr << "  \xe2\x9c\x97 MISMATCH \xe2\x80\x94 " << mismatch << "\n";
+    return 1;
+}
+
 static int cmd_roundtrip(const std::string& in_path) {
+    std::error_code ec;
+    if (fs::is_directory(in_path, ec)) {
+        return cmd_roundtrip_archive(in_path);
+    }
+
     auto original = read_file(in_path);
     std::cout << "K2 roundtrip: " << in_path << " (" << original.size() << " bytes)\n";
 
