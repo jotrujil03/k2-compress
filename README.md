@@ -61,12 +61,16 @@ pip install numpy onnxruntime zstandard
 
 # Optional: for training neural predictors
 pip install torch
-2. Build the C++ Components
-Bashmkdir -p build && cd build
+```
+### 2. Build the C++ Components
+```bash
+mkdir -p build && cd build
 cmake -DCMAKE_BUILD_TYPE=Release ..
 make -j$(nproc)
-3. Run Tests
-Bash# C++ tests
+```
+### 3. Run Tests
+```bash
+# C++ tests
 ./bin/k2_test
 ./bin/k2archive_test
 
@@ -74,6 +78,7 @@ Bash# C++ tests
 python -m pytest src/python/
 
 ```
+---
 
 # Usage
 ## Command Line Tool (k2cli)
@@ -91,7 +96,7 @@ python -m pytest src/python/
 # Extract .k2a archive
 ./bin/k2cli decompress archive.k2a.001 ./restored_assets/
 ```
-
+---
 # Python API
 ```python
 from adaptive_optimizer import K2Pipeline
@@ -108,7 +113,7 @@ print(f"Detected Data Class: {hint.data_class.name}")
 # Full compression
 compressed_frame = pipeline.compress_full(data)
 ```
-
+---
 # C++ API
 ```c
 #include "k2_bridge.h"
@@ -127,7 +132,7 @@ int main() {
     return 0;
 }
 ```
-
+---
 # Integration Notes
 
 - The C++ bridge safely manages the embedded Python runtime and releases the GIL during performance-critical operations.
@@ -139,6 +144,5 @@ int main() {
 # License
 This project is licensed under the 3-Clause BSD License.
 
----
 
 For detailed API documentation, benchmark results, and training guides, see the docs/ folder (when available) or the test suite.
