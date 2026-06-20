@@ -1,238 +1,141 @@
-# OpenZL Neural Extension
+# K2 Compression Pipeline
 
-Layering **auto structure discovery**, **hybrid neural prediction**, and
-**adaptive optimization** on top of Meta's [OpenZL](https://github.com/facebook/openzl)
-compression framework.
+**K2** is a sophisticated, adaptive end-to-end compression pipeline that combines automatic structure discovery, hybrid neural/statistical prediction, and bandit-driven optimization on top of the high-performance **ASDP-LH** bit-domain context-mixing codec.
 
-```
-openzl_neural/
-├── include/
-│   └── openzl_neural_bridge.h    C/C++ bridge (pybind11 + plain C API)
-├── src/
-│   └── python/
-│       ├── structure_discovery.py   Layer 1 — auto data-type detection
-│       ├── hybrid_predictor.py      Layer 2 — neural + statistical mixer
-│       ├── adaptive_optimizer.py    Layer 3 — UCB1 bandit strategy tuner
-│       └── train_predictor.py       Offline LSTM / MiniTransformer training
-├── tests/
-│   └── test_pipeline_integration.py  Full-stack tests + benchmark
-├── models/                           (output dir for trained .pt / .onnx files)
-└── configs/                          (optional SDDL graph configs)
-```
+It intelligently analyzes incoming data streams in real time, detects underlying structure, applies optimal transforms, and dynamically selects compression strategies to achieve superior ratios across text, numerical time-series, columnar data, and mixed binary assets.
 
 ---
 
-## Architecture
+## Key Features
 
-```
-Raw data stream
-      │
-      ▼
-┌─────────────────────────────┐
-│   StructureDiscovery        │  Layer 1
-│   • Entropy analysis        │  Lightweight ML probe
-│   • Delta / repeat heuristics│  + optional ONNX classifier
-│   • Element-size detection  │
-│   → StructureHint           │
-└──────────────┬──────────────┘
-               │ hint (DataClass, transforms[], element_size, ...)
-               ▼
-┌─────────────────────────────┐
-│   AdaptiveOptimizer         │  Layer 3
-│   • UCB1 bandit over        │  (initialised with hint-specific
-│     strategy pool           │   strategy candidates)
-│   • Per-chunk timing        │
-│   → Strategy (alpha, mode,  │
-│     chunk_size, transforms) │
-└──────────────┬──────────────┘
-               │ HybridConfig
-               ▼
-┌─────────────────────────────┐
-│   HybridPredictor           │  Layer 2
-│   • StatisticalModel        │  Order-1 Markov (always on)
-│     (order-1 Markov)        │
-│   • NeuralBackend           │  One of:
-│     ├─ LinearCMA            │    Weighted order-N model blend
-│     ├─ LSTMPredictor        │    PyTorch LSTM (~200K params)
-│     ├─ MiniTransformer      │    4-layer causal transformer
-│     └─ ONNXPredictor        │    Any exported ONNX model
-│   • Log-linear mixing       │
-│   → blended P(next byte)    │
-│   → ArithmeticEncoder       │
-└──────────────┬──────────────┘
-               │
-               ▼
-      OpenZL graph backend
-      (Zstd / SDDL transforms)
-```
+- **Automatic Structure Discovery** — Analyzes entropy, repeat patterns, element alignment, and strides to classify data (Timeseries, Float Arrays, Text, Columnar, etc.).
+- **Hybrid Predictor** — Combines fast online Markov models with optional deep learning models (LSTM / causal Transformers) via log-linear mixing.
+- **Bandit-Driven Adaptive Optimizer** — Uses UCB1 multi-armed bandit algorithm to continuously tune strategy parameters for best ratio vs. speed trade-off.
+- **ASDP-LH Backend** — Leverages the powerful bit-level logistic mixing engine for final entropy coding.
+- **Multi-Format Support** — Single-file `.k2` frames and multi-volume `.k2a` directory archives.
+
+---
+
+## Directory Structure
+k2/
+├── include/
+│   ├── k2_bridge.h          # C++ RAII wrapper and plain C API
+│   └── k2archive.h          # K2A multi-volume archive format
+├── src/
+│   ├── cpp/
+│   │   ├── k2_bridge.cpp    # Bridge implementation + CPython management
+│   │   ├── k2cli.cpp        # Command-line interface
+│   │   └── k2archive.cpp    # Multi-volume archive handling
+│   └── python/
+│       ├── structure_discovery.py   # Layer 1: Data type & pattern detection
+│       ├── hybrid_predictor.py      # Layer 2: Statistical + neural mixing
+│       ├── adaptive_optimizer.py    # Layer 3: UCB1 bandit strategy selection
+│       └── train_predictor.py       # Offline model training utilities
+└── tests/
+├── k2archive_test.cpp
+└── test_pipeline_integration.py
+text
+---
+
+## Architecture Overview
+
+1. **Layer 1: Structure Discovery**  
+   Samples the input stream to compute byte entropy, repeat density, element widths, and alignment. Maps data to the most suitable transformation strategy.
+
+2. **Layer 2: Hybrid Predictor**  
+   Blends fast order-1 Markov models with optional neural networks (LSTM or Mini-Transformers) using sophisticated probability mixing.
+
+3. **Layer 3: Adaptive Optimizer**  
+   Employs a UCB1 multi-armed bandit to dynamically select and tune the best compression strategy per chunk, balancing compression ratio and throughput.
+
+The final entropy coding is performed by the **ASDP-LH** engine.
 
 ---
 
 ## Quick Start
 
-### 1. Install Python dependencies
-
+### 1. Install Python Dependencies
 ```bash
 pip install numpy onnxruntime zstandard
-# Optional for LSTM/Transformer training:
+
+# Optional: for training neural predictors
 pip install torch
+2. Build the C++ Components
+Bashmkdir -p build && cd build
+cmake -DCMAKE_BUILD_TYPE=Release ..
+make -j$(nproc)
+3. Run Tests
+Bash# C++ tests
+./bin/k2_test
+./bin/k2archive_test
+
+# Python tests
+python -m pytest src/python/
+
 ```
 
-### 2. Run the self-tests
-
+# Usage
+## Command Line Tool (k2cli)
 ```bash
-cd openzl_neural
-python tests/test_pipeline_integration.py
+
+# Compress single file
+./bin/k2cli compress input.bin output.k2
+
+# Decompress single file
+./bin/k2cli decompress output.k2 restored.bin
+
+# Archive entire directory (multi-volume .k2a)
+./bin/k2cli compress ./my_assets/ archive.k2a
+
+# Extract .k2a archive
+./bin/k2cli decompress archive.k2a.001 ./restored_assets/
 ```
 
-### 3. Use the pipeline in Python
+# Python API
+Pythonfrom adaptive_optimizer import K2Pipeline
 
-```python
-from adaptive_optimizer import OpenZLNeuralPipeline
+pipeline = K2Pipeline(exploration=1.0, latency_weight=0.15)
 
-pipeline = OpenZLNeuralPipeline(
-    exploration=1.0,       # UCB1 exploration constant
-    latency_weight=0.15,   # speed vs. ratio trade-off
-)
-
-with open("my_data.bin", "rb") as f:
+with open("data.bin", "rb") as f:
     data = f.read()
 
-# Analyse structure, initialise strategies
+# Analyze and prepare strategy
 hint = pipeline.prepare(data[:65536])
-print(f"Detected: {hint.data_class.name}")
-print(f"Suggested transforms: {hint.suggested_transforms}")
+print(f"Detected Data Class: {hint.data_class.name}")
 
-# Compress (adaptive; improves with each call)
-compressed = pipeline.compress(data)
-print(f"Ratio: {len(data)/len(compressed):.2f}x")
-print(pipeline.stats())
+# Full compression
+compressed_frame = pipeline.compress_full(data)
+
+# C++ API
+```c
+#include "k2_bridge.h"
+
+int main() {
+    K2Handle* pipeline = k2_create(nullptr, 1.0, 0.15);
+
+    // Prepare on sample data
+    k2_prepare(pipeline, sample_buffer, sample_size);
+
+    // Compress
+    size_t compressed_size = 0;
+    k2_compress(pipeline, src, src_len, dst, dst_capacity, &compressed_size);
+
+    k2_destroy(pipeline);
+    return 0;
+}
 ```
 
-### 4. Train a neural predictor (optional, improves ratio)
+# Integration Notes
 
-```bash
-python src/python/train_predictor.py \
-    --data-dir /path/to/representative/data \
-    --model lstm \
-    --embed-dim 32 \
-    --hidden 128 \
-    --epochs 10 \
-    --output models/predictor.pt \
-    --export-onnx models/predictor.onnx
-```
-
-Then pass `onnx_model_path="models/predictor.onnx"` to `OpenZLNeuralPipeline`.
-
-### 5. C++ integration (with pybind11)
-
-```cpp
-// In your OpenZL codec node:
-#include "openzl_neural_bridge.h"
-
-// Option A: C++ RAII wrapper
-ozl_neural::NeuralBridge bridge(
-    "./src/python",          // directory with .py files
-    "models/predictor.onnx", // optional ONNX model
-    1.0,                     // exploration
-    0.15                     // latency_weight
-);
-bridge.prepare(header_bytes, header_len);
-auto compressed = bridge.compress(data, data_len);
-
-// Option B: Plain C API
-OZLNeuralHandle* h = ozl_neural_create(
-    "models/predictor.onnx", 1.0, 0.15
-);
-ozl_neural_prepare(h, sample, sample_len);
-uint8_t out[MAX_OUT]; size_t out_len;
-ozl_neural_compress(h, src, src_len, out, sizeof(out), &out_len);
-printf("%s\n", ozl_neural_stats(h));
-ozl_neural_destroy(h);
-```
-
-Build with CMake:
-```cmake
-find_package(pybind11 REQUIRED)
-target_link_libraries(your_target PRIVATE pybind11::embed)
-target_include_directories(your_target PRIVATE openzl_neural/include)
-```
+The C++ bridge safely manages the embedded Python runtime and releases the GIL during performance-critical operations.
+K2Handle objects are not thread-safe; use one per thread or serialize access.
+Compressed .k2 frames and .k2a archives are self-describing and versioned.
 
 ---
 
-## Layer Details
-
-### Layer 1: Structure Discovery (`structure_discovery.py`)
-
-| Signal | Method | Used for |
-|---|---|---|
-| Byte entropy | Shannon H(X) | Detect already-compressed data |
-| Element width | Delta entropy minimisation | le-u32 vs le-u64 etc. |
-| Delta gain | Before/after delta transform | Time-series detection |
-| Repeat density | 8-byte window hashing | Integer array detection |
-| Column stride | Autocorrelation | Struct-of-arrays detection |
-| Float heuristic | IEEE 754 exponent spread | Float array detection |
-| Text heuristic | Printable ASCII ratio | Text/CSV detection |
-| ONNX classifier | 64-dim feature → 8 classes | Overrides heuristics when conf > 0.70 |
-
-### Layer 2: Hybrid Predictor (`hybrid_predictor.py`)
-
-**Predictor modes** (selectable per-chunk by the optimizer):
-
-| Mode | Params | Speed | Quality |
-|---|---|---|---|
-| `LINEAR_CMA` | 0 (online) | ★★★★★ | ★★★ |
-| `LSTM` | ~200K | ★★★ | ★★★★ |
-| `MINI_TRANSFORMER` | ~1.2M | ★★ | ★★★★★ |
-| `ONNX` | model-dependent | ★★★★ | ★★★★ |
-| `PASSTHROUGH` | 0 | ★★★★★ | ★★ (Zstd only) |
-
-**Mixing**: log-linear interpolation  
-`log P_blend = (1-α)·log P_stat + α·log P_neural`  
-Alpha is tuned dynamically by the optimizer.
-
-### Layer 3: Adaptive Optimizer (`adaptive_optimizer.py`)
-
-**UCB1 bandit** selects among strategy variants that differ in:
-- Predictor mode + alpha
-- Chunk size (latency / context quality trade-off)
-- Transform chain (matches OpenZL SDDL graph path)
-- Zstd fallback level
-
-Score function per chunk:  
-`score = (1-w)·log₂(ratio) + w·log₂(throughput_MBs)`
-
-Alpha is gradient-free tuned every 10 chunks via performance trend.
+License
+This project is licensed under the 3-Clause BSD License.
 
 ---
 
-## Integration with OpenZL's Graph System
-
-OpenZL represents compression as a **DAG of codec nodes** (SDDL graph).
-This extension adds a `NeuralCodec` node type that:
-
-1. Sits **after** OpenZL's structural transforms (delta, column-split, etc.)
-2. Replaces or supplements the final Zstd entropy-coding stage
-3. Reports its compressed output back into the graph's typed message stream
-
-The `StructureHint.suggested_transforms` list maps directly to
-OpenZL SDDL primitive names, enabling auto-generation of a compression
-graph from the discovery output.
-
----
-
-## Roadmap / Contribution Ideas
-
-- [ ] Grid/tensor transforms for ML model weights (float16/bfloat16)
-- [ ] Distil a smaller LSTM (embed=16, hidden=64) for embedded targets
-- [ ] ONNX Runtime quantisation (INT8) for faster CPU inference
-- [ ] Online classifier training (label new data-types on the fly)
-- [ ] Stream the arithmetic coder for truly zero-latency output
-- [ ] Benchmark suite vs. OpenZL baseline + Zstd + LZMA on Silesia corpus
-- [ ] Plug into OpenZL's `--trainer` to generate SDDL plans automatically
-
----
-
-## License
-
-BSD 3-Clause, consistent with OpenZL's own license.
+For detailed API documentation, benchmark results, and training guides, see the docs/ folder (when available) or the test suite.
