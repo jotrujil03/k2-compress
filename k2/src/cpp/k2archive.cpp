@@ -65,20 +65,31 @@ bool get_le(const uint8_t* p, size_t avail, T& out) {
 }
 
 uint32_t crc32(const uint8_t* data, size_t len) {
-    static uint32_t table[256];
-    static bool init = false;
-    if (!init) {
-        for (uint32_t i = 0; i < 256; ++i) {
-            uint32_t c = i;
-            for (int k = 0; k < 8; ++k)
-                c = (c & 1) ? (0xEDB88320u ^ (c >> 1)) : (c >> 1);
-            table[i] = c;
+    // C++11 guarantees thread-safe initialization of function-local statics.
+    // Previously this used a separate `static uint32_t table[256]` +
+    // `static bool init` with a non-atomic check-then-fill — the same race
+    // pattern found and fixed in ASDP's cm.cpp stretch/squash tables (see
+    // that file for the ThreadSanitizer-confirmed repro). Not currently
+    // reachable concurrently in this codebase (both call sites run on the
+    // single thread driving pack_directory/unpack_archive, never from the
+    // per-block parallel workers), but fixed regardless since that's a
+    // fragile invariant to rely on going forward.
+    struct Table {
+        uint32_t v[256];
+        Table() noexcept {
+            for (uint32_t i = 0; i < 256; ++i) {
+                uint32_t c = i;
+                for (int k = 0; k < 8; ++k)
+                    c = (c & 1) ? (0xEDB88320u ^ (c >> 1)) : (c >> 1);
+                v[i] = c;
+            }
         }
-        init = true;
-    }
+    };
+    static const Table table;
+
     uint32_t c = 0xFFFFFFFFu;
     for (size_t i = 0; i < len; ++i)
-        c = table[(c ^ data[i]) & 0xFF] ^ (c >> 8);
+        c = table.v[(c ^ data[i]) & 0xFF] ^ (c >> 8);
     return c ^ 0xFFFFFFFFu;
 }
 
@@ -378,7 +389,8 @@ private:
 ArchiveError pack_directory(const std::string& input_dir,
                              const std::string& output_path,
                              const ArchiveConfig& cfg,
-                             std::string* err_detail) {
+                             std::string* err_detail,
+                             PackStats* stats_out) {
     std::error_code ec;
     fs::path root(input_dir);
     if (!fs::exists(root, ec) || !fs::is_directory(root, ec)) {
@@ -422,10 +434,28 @@ ArchiveError pack_directory(const std::string& input_dir,
     // parallelizes across cfg.n_threads for that block's data, so no
     // archive-level thread pool is needed, memory stays bounded to one
     // block's buffers, and volume writes are strictly sequential.
+    //
+    // IMPORTANT — bug fixed here, confirmed by direct observation (single
+    // core active during compress, all cores active during decompress):
+    // acfg.min_block_bytes is the floor for ASDP's OWN internal sub-block
+    // splitting within a single asdp_compress() call. It is a DIFFERENT
+    // knob from cfg.block_target_bytes (which controls K2A-level file
+    // grouping, chosen for ratio reasons — see the design doc). Setting
+    // acfg.min_block_bytes = cfg.block_target_bytes made every K2A block
+    // buffer exactly equal to ASDP's own splitting floor, so
+    // asdp_compress()'s plan_blocks() always took its "src_len <=
+    // min_block" early-out and produced a single internal block —
+    // compression silently ran single-threaded for every K2A block,
+    // regardless of cfg.n_threads, while decompression (which uses
+    // asdp_default_config()'s untouched min_block_bytes) parallelized
+    // correctly. These two knobs must stay independent: leave ASDP's
+    // internal floor at its own default so a K2A block has room to split
+    // across threads internally.
     asdp_config_t acfg = asdp_default_config();
     acfg.level = cfg.asdp_level;
     acfg.n_threads = cfg.n_threads;
-    acfg.min_block_bytes = cfg.block_target_bytes;
+    // acfg.min_block_bytes intentionally left at asdp_default_config()'s
+    // own default (8 MB) — do not tie it to cfg.block_target_bytes.
     acfg.no_split_below_bytes = std::min<uint64_t>(cfg.block_target_bytes, uint64_t(4) << 20);
 
     for (const auto& blk : blocks) {
@@ -455,6 +485,11 @@ ArchiveError pack_directory(const std::string& input_dir,
         size_t comp_len = 0;
         const int rc = asdp_compress(actx, block_buf.data(), block_buf.size(),
                                       comp.data(), comp.size(), &comp_len);
+        if (stats_out) {
+            asdp_stats_t st{};
+            asdp_stats(actx, &st);
+            stats_out->asdp_threads_used_per_block.push_back(st.n_threads_used);
+        }
         asdp_destroy(actx);
         if (rc != ASDP_OK) {
             if (err_detail) *err_detail = std::string("asdp_compress: ") + asdp_error_str(rc);
@@ -467,6 +502,10 @@ ArchiveError pack_directory(const std::string& input_dir,
     }
 
     if (!writer.finalize(err_detail)) return ArchiveError::io_error;
+    if (stats_out) {
+        stats_out->n_k2a_blocks = uint32_t(blocks.size());
+        stats_out->n_volumes = writer.volumes_written();
+    }
     return ArchiveError::ok;
 }
 

@@ -79,11 +79,22 @@ struct ManifestEntry {
 
 struct ArchiveConfig {
     uint64_t volume_size_bytes = DEFAULT_VOLUME_SIZE;
-    // Target size for each K2A block (NOT the same as asdp_config_t's
-    // min_block_bytes, though it's used as that value when compressing each
-    // block — see k2a_format_design.md open-question 1 for why K2A blocks
-    // are sized independently rather than as total_size/n_threads).
-    uint64_t block_target_bytes = uint64_t(8) * 1024 * 1024;
+    // Target size for each K2A block (file-boundary grouping for ratio —
+    // NOT the same as asdp_config_t's min_block_bytes, which controls
+    // ASDP's OWN internal sub-block splitting for thread parallelism
+    // within a single asdp_compress() call on one K2A block's buffer).
+    //
+    // This must stay well above ASDP's internal min_block_bytes (8 MB
+    // default) or a K2A block has no room to split internally and
+    // compression effectively runs single-threaded regardless of
+    // n_threads — this exact bug was found and fixed (see k2archive.cpp,
+    // pack_directory): with the previous 8 MB default, each K2A block was
+    // <= ASDP's own 8 MB floor, so asdp_compress()'s internal planner
+    // always took its single-block early-out. 128 MB gives each K2A block
+    // room for up to ~16 internal sub-blocks at ASDP's default floor,
+    // matching common consumer thread counts (e.g. Ryzen 5900HS, 16
+    // threads) — confirmed by direct profiling, see k2a_format_design.md.
+    uint64_t block_target_bytes = uint64_t(128) * 1024 * 1024;
     int      n_threads = 0;          // 0 = hardware_concurrency()
     int      asdp_level = 3;
 };
@@ -91,6 +102,22 @@ struct ArchiveConfig {
 // ---------------------------------------------------------------------------
 // Public API
 // ---------------------------------------------------------------------------
+
+/**
+ * Optional diagnostics from a pack_directory() call, useful for tests and
+ * telemetry (e.g. confirming internal parallelism is actually engaged —
+ * see the min_block_bytes/block_target_bytes note on ArchiveConfig above).
+ */
+struct PackStats {
+    uint32_t n_k2a_blocks = 0;          // number of K2A (file-group) blocks
+    uint32_t n_volumes = 0;
+    // Per-K2A-block ASDP thread usage, in block order. max_element of this
+    // should be > 1 on a multi-core machine with a realistic-sized
+    // directory — if it's always 1, internal parallelism isn't engaging
+    // (this is exactly the bug fixed in pack_directory; see the comment
+    // there for the full story).
+    std::vector<int> asdp_threads_used_per_block;
+};
 
 /**
  * Recursively pack `input_dir` into a K2A archive at `output_path`.
@@ -106,7 +133,8 @@ struct ArchiveConfig {
 ArchiveError pack_directory(const std::string& input_dir,
                              const std::string& output_path,
                              const ArchiveConfig& cfg,
-                             std::string* err_detail = nullptr);
+                             std::string* err_detail = nullptr,
+                             PackStats* stats_out = nullptr);
 
 /**
  * Unpack a K2A archive (single or multi-volume) into `output_dir`.

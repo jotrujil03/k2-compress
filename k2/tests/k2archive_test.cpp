@@ -237,6 +237,60 @@ int main() {
         CHECK(!k2a::looks_like_k2a((tmp / "not_an_archive").string()), "non-archive correctly rejected");
     }
 
+    // --- Test 8: internal parallelism actually engages (regression test) ---
+    //
+    // Bug history: ArchiveConfig::block_target_bytes (K2A's file-grouping
+    // size) was previously also used as asdp_config_t::min_block_bytes (the
+    // floor for ASDP's OWN internal sub-block splitting). Since each K2A
+    // block buffer is exactly block_target_bytes by construction, this made
+    // ASDP's planner take its "src_len <= min_block" single-block early-out
+    // every time — compression silently ran on exactly 1 thread regardless
+    // of n_threads, while decompression (a separate code path with its own
+    // untouched default config) parallelized correctly. Found by directly
+    // observing CPU utilization during a real 12GB+ roundtrip: one core
+    // active during compress, all cores during decompress.
+    //
+    // This test forces n_threads=4 (independent of how many cores the test
+    // runner actually has — what matters is whether ASDP's internal planner
+    // is GIVEN the chance to use more than one thread, not whether the
+    // hardware can satisfy it) and a directory just over the default
+    // block_target_bytes, then asserts more than one thread was actually
+    // used for at least one K2A block.
+    {
+        std::printf("\n[test_internal_parallelism_engages]\n");
+        fs::path src = tmp / "src8";
+        // ~12MB of incompressible-ish data across a few files: large enough
+        // relative to ASDP's internal min_block_bytes default (8MB) that a
+        // single K2A block has real room to split, small enough to stay
+        // fast in CI.
+        for (int i = 0; i < 4; ++i)
+            write_file(src / ("part_" + std::to_string(i) + ".bin"),
+                       make_random(3 * 1024 * 1024, uint32_t(200 + i)));
+
+        k2a::ArchiveConfig cfg;
+        cfg.n_threads = 4;
+        cfg.volume_size_bytes = uint64_t(1) << 30;
+        // Leave block_target_bytes at its default (128MB) -- the whole 12MB
+        // test directory lands in a single K2A block, exactly the
+        // regression scenario.
+        k2a::PackStats stats;
+        std::string err;
+        auto rc = k2a::pack_directory(src.string(), (tmp / "parallel_archive").string(),
+                                       cfg, &err, &stats);
+        CHECK(rc == k2a::ArchiveError::ok, "pack succeeds for internal-parallelism test");
+        CHECK(stats.n_k2a_blocks == 1u, "test directory lands in a single K2A block (as intended)");
+
+        int max_threads_used = 0;
+        for (int t : stats.asdp_threads_used_per_block) max_threads_used = std::max(max_threads_used, t);
+        std::printf("    n_k2a_blocks=%u  threads_used_per_block=[", stats.n_k2a_blocks);
+        for (size_t i = 0; i < stats.asdp_threads_used_per_block.size(); ++i)
+            std::printf("%s%d", i ? "," : "", stats.asdp_threads_used_per_block[i]);
+        std::printf("]\n");
+        CHECK(max_threads_used > 1,
+              "internal ASDP parallelism actually engages (n_threads_used > 1) -- "
+              "regression guard for the single-thread-compress bug");
+    }
+
     std::printf("\n%s\n", g_fail == 0 ? "ALL K2ARCHIVE TESTS PASSED" : "FAILURES PRESENT");
     return g_fail == 0 ? 0 : 1;
 }
