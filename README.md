@@ -130,13 +130,13 @@ int main() {
 
 # Integration Notes
 
-The C++ bridge safely manages the embedded Python runtime and releases the GIL during performance-critical operations.
-K2Handle objects are not thread-safe; use one per thread or serialize access.
-Compressed .k2 frames and .k2a archives are self-describing and versioned.
+- The C++ bridge safely manages the embedded Python runtime and releases the GIL during performance-critical operations.
+- K2Handle objects are not thread-safe; use one per thread or serialize access.
+- Compressed .k2 frames and .k2a archives are self-describing and versioned.
 
 ---
 
-License
+# License
 This project is licensed under the 3-Clause BSD License.
 
 ---
