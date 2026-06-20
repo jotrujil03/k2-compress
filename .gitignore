@@ -4,6 +4,9 @@ openzl/
 # Silesia
 silesia/
 
+# Ignore (self-explanatory)
+ignore/
+
 # ASDP-LH (fix later)
 asdp-lh/
 

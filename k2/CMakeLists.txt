@@ -119,6 +119,7 @@ target_link_libraries(k2
 
 add_executable(k2cli
     src/cpp/k2cli.cpp
+    src/cpp/k2archive.cpp
 )
 
 target_include_directories(k2cli PRIVATE
@@ -166,6 +167,18 @@ if(K2_BUILD_TESTS)
     set_tests_properties(k2_bridge_test PROPERTIES
         ENVIRONMENT "PYTHONPATH=${Python3_SITELIB}"
     )
+
+    # k2archive has no pybind11/Python dependency — pure C++ on top of asdp.
+    add_executable(k2archive_test
+        tests/k2archive_test.cpp
+        src/cpp/k2archive.cpp
+    )
+    target_include_directories(k2archive_test PRIVATE
+        ${K2_ROOT}/include
+        ${ASDP_ROOT}/include
+    )
+    target_link_libraries(k2archive_test PRIVATE asdp)
+    add_test(NAME k2archive_test COMMAND k2archive_test)
 endif()
 
 # ---------------------------------------------------------------------------

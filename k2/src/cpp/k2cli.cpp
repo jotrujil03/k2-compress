@@ -17,6 +17,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <fstream>
 #include <iomanip>
 #include <iostream>
@@ -25,6 +26,9 @@
 #include <vector>
 
 #include "k2_bridge.h"   // pulls in asdp/asdp.h for asdp_compress_bound()
+#include "k2archive.h"   // directory archive (manifest + multi-volume)
+
+namespace fs = std::filesystem;
 
 static std::vector<uint8_t> read_file(const std::string& path) {
     std::ifstream f(path, std::ios::binary | std::ios::ate);
@@ -52,8 +56,11 @@ static K2Handle* make_handle() {
 static void usage() {
     std::cerr <<
         "Usage:\n"
-        "  k2cli compress   <input> <output.k2>\n"
-        "  k2cli decompress <input.k2> <output>\n"
+        "  k2cli compress   <input> <output.k2>      (file -> .k2)\n"
+        "  k2cli compress   <input_dir> <output>     (directory -> .k2a archive,\n"
+        "                                              auto multi-volume if large)\n"
+        "  k2cli decompress <input.k2> <output>      (.k2 -> file)\n"
+        "  k2cli decompress <archive> <output_dir>   (.k2a[.NNN] -> directory)\n"
         "  k2cli roundtrip  <input>\n"
         "  k2cli parallel   <input> <n_threads>\n"
         "  k2cli stats      <input>\n"
@@ -72,7 +79,43 @@ static size_t output_bound(size_t input_size) {
     return asdp_compress_bound(input_size) + 256;
 }
 
+static int cmd_compress_archive(const std::string& in_path, const std::string& out_path) {
+    std::cout << "K2 archive compress: " << in_path << " (directory)\n";
+    k2a::ArchiveConfig cfg;   // defaults: 4GB volumes, 8MB blocks, auto threads
+    std::string err;
+    auto rc = k2a::pack_directory(in_path, out_path, cfg, &err);
+    if (rc != k2a::ArchiveError::ok) {
+        std::cerr << "k2cli: archive pack failed: " << k2a::archive_error_str(rc);
+        if (!err.empty()) std::cerr << " (" << err << ")";
+        std::cerr << "\n";
+        return 1;
+    }
+    std::cout << "  → " << out_path << ".001"
+                  "  (run 'k2cli decompress " << out_path << " <out_dir>' to unpack)\n";
+    return 0;
+}
+
+static int cmd_decompress_archive(const std::string& in_path, const std::string& out_dir) {
+    std::cout << "K2 archive decompress: " << in_path << " → " << out_dir << "/\n";
+    k2a::ArchiveConfig cfg;
+    std::string err;
+    auto rc = k2a::unpack_archive(in_path, out_dir, cfg, &err);
+    if (rc != k2a::ArchiveError::ok) {
+        std::cerr << "k2cli: archive unpack failed: " << k2a::archive_error_str(rc);
+        if (!err.empty()) std::cerr << " (" << err << ")";
+        std::cerr << "\n";
+        return 1;
+    }
+    std::cout << "  ✓ unpacked to " << out_dir << "/\n";
+    return 0;
+}
+
 static int cmd_compress(const std::string& in_path, const std::string& out_path) {
+    std::error_code ec;
+    if (fs::is_directory(in_path, ec)) {
+        return cmd_compress_archive(in_path, out_path);
+    }
+
     auto data = read_file(in_path);
     std::cout << "K2 compress: " << in_path << " (" << data.size() << " bytes)\n";
 
@@ -100,6 +143,10 @@ static int cmd_compress(const std::string& in_path, const std::string& out_path)
 }
 
 static int cmd_decompress(const std::string& in_path, const std::string& out_path) {
+    if (k2a::looks_like_k2a(in_path)) {
+        return cmd_decompress_archive(in_path, out_path);
+    }
+
     auto data = read_file(in_path);
     std::cout << "K2 decompress: " << in_path << " (" << data.size() << " bytes)\n";
 

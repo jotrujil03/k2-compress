@@ -312,12 +312,15 @@ public:
     std::string stats() {
         py::gil_scoped_acquire gil;
         py::dict d = _pipeline.attr("stats")();
+        d["asdp_n_blocks"]        = _last_asdp_stats.n_blocks;
+        d["asdp_n_threads_used"]  = _last_asdp_stats.n_threads_used;
         return py::module_::import("json").attr("dumps")(d).cast<std::string>();
     }
 
 private:
     py::object _pipeline;
     int        _asdp_level;
+    asdp_stats_t _last_asdp_stats{};
 
     // ------------------------------------------------------------------
     // ASDP entropy backend (pure C++, no GIL).  A context is created per
@@ -335,6 +338,7 @@ private:
         std::vector<uint8_t> out(bound);
         size_t out_len = 0;
         const int rc = asdp_compress(ctx, pl, plen, out.data(), bound, &out_len);
+        asdp_stats(ctx, &_last_asdp_stats);
         asdp_destroy(ctx);
         if (rc != ASDP_OK)
             throw std::runtime_error(std::string("asdp_compress: ") + asdp_error_str(rc));
