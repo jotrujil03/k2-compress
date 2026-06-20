@@ -17,6 +17,7 @@ It intelligently analyzes incoming data streams in real time, detects underlying
 ---
 
 ## Directory Structure
+```text
 k2/
 ├── include/
 │   ├── k2_bridge.h          # C++ RAII wrapper and plain C API
@@ -34,7 +35,7 @@ k2/
 └── tests/
 ├── k2archive_test.cpp
 └── test_pipeline_integration.py
-text
+```
 ---
 
 ## Architecture Overview
@@ -92,7 +93,8 @@ python -m pytest src/python/
 ```
 
 # Python API
-Pythonfrom adaptive_optimizer import K2Pipeline
+```python
+from adaptive_optimizer import K2Pipeline
 
 pipeline = K2Pipeline(exploration=1.0, latency_weight=0.15)
 
@@ -105,6 +107,7 @@ print(f"Detected Data Class: {hint.data_class.name}")
 
 # Full compression
 compressed_frame = pipeline.compress_full(data)
+```
 
 # C++ API
 ```c
