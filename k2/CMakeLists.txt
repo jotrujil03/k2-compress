@@ -137,6 +137,22 @@ target_link_libraries(k2cli
 target_compile_definitions(k2cli PRIVATE K2_PYTHON_MODULE_DIR="${K2_PY_DIR}")
 
 # ---------------------------------------------------------------------------
+# measure_gain_tool — training-data-generation utility for
+# train_predictor.py's gain-predictor command. Pure C++ on top of asdp, no
+# pybind11/Python dependency (mirrors k2archive_test below), so it builds
+# and runs in any environment with a C++ toolchain, independent of whether
+# the full Python bridge is set up.
+# ---------------------------------------------------------------------------
+
+add_executable(measure_gain_tool
+    src/cpp/measure_gain_tool.cpp
+)
+target_include_directories(measure_gain_tool PRIVATE
+    ${ASDP_ROOT}/include
+)
+target_link_libraries(measure_gain_tool PRIVATE asdp)
+
+# ---------------------------------------------------------------------------
 # Tests
 # ---------------------------------------------------------------------------
 

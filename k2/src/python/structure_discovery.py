@@ -7,11 +7,32 @@ Lightweight ML probe that analyzes raw byte/chunk data to:
   1. Compute entropy and detect regularity signals
   2. Identify common patterns: delta sequences, run-length candidates,
      columnar repeats, floating-point arrays, text-like data
-  3. Classify into an OpenZL SDDL-compatible structure hint
+  3. Classify into a StructureHint describing the data's likely layout
   4. Optionally use a tiny ONNX classifier for richer type detection
 
-The output is a StructureHint that the HybridPredictor and
-AdaptiveOptimizer consume to select transforms/graphs.
+Division of labor with the C++ ASDP/CM backend
+------------------------------------------------
+ASDP's own pick_transform_cm() (asdp.cpp) already does a real, empirically
+validated trial-encode search over {none, bytedelta_1/2/4/8, bytesplit_4/8}
+on every block, before context-mixing entropy coding. That search is ground
+truth: it measures actual CM-encoded size, not a heuristic proxy, and it
+always includes "none" as a candidate, so it can never make a block worse
+than skipping a transform.
+
+This module therefore does NOT try to re-pick bytedelta/bytesplit — Python
+duplicating that search would just be a slower, less accurate copy of work
+C++ already does correctly. Instead, StructureDiscovery focuses on the one
+real gap: transforms ASDP's C++ layer cannot do at all today, primarily
+columnsplit (true struct-of-arrays reordering for interleaved/columnar
+records). The suggested transform chain runs ONCE in Python, upstream of
+ASDP; C++'s own trial-encode then runs independently on whatever bytes
+Python hands it, exactly as it does for any other input. There is no zstd
+fallback anywhere in this pipeline (backend 0x04 / ASDP-LH is the only
+entropy backend) — any reference to zstd/bwt/mtf in older versions of this
+file predates that decision and has been removed.
+
+The output is a StructureHint that AdaptiveOptimizer/K2Pipeline consume to
+select the upstream transform chain.
 """
 
 from __future__ import annotations
@@ -34,7 +55,7 @@ except ImportError:
 
 
 # ---------------------------------------------------------------------------
-# Data-type taxonomy (maps loosely to OpenZL SDDL primitives)
+# Data-type taxonomy
 # ---------------------------------------------------------------------------
 
 class DataClass(Enum):
@@ -154,6 +175,12 @@ def _detect_column_stride(data: bytes, candidate_sizes=(4, 8, 12, 16, 24, 32)) -
     """
     Columnar data often has periodic structure.  Check autocorrelation of
     byte values at candidate strides.
+
+    Note: this only tests a fixed list of candidate strides. A record
+    layout whose true byte width isn't in candidate_sizes (e.g. a 14-byte
+    record) won't be detected even if it's genuinely columnar — caller
+    falls through to whatever other DataClass heuristics fit instead, not
+    a crash, but a real detection gap worth knowing about.
     """
     probe = np.frombuffer(data[:8192], dtype=np.uint8).astype(np.float32)
     if len(probe) < 64:
@@ -165,7 +192,17 @@ def _detect_column_stride(data: bytes, candidate_sizes=(4, 8, 12, 16, 24, 32)) -
         # Mean absolute correlation at multiples of stride
         shifted = probe[stride:]
         base = probe[: len(shifted)]
+        # np.corrcoef divides by each array's stddev; a zero-variance
+        # window (e.g. a constant byte run landing in the probe) produces
+        # NaN, which silently loses the "corr > best_corr" comparison
+        # rather than crashing -- but that means a real stride could be
+        # missed without any signal that something was skipped. Guard
+        # explicitly instead of relying on NaN comparison semantics.
+        if base.std() == 0.0 or shifted.std() == 0.0:
+            continue
         corr = float(np.corrcoef(base, shifted)[0, 1])
+        if not np.isfinite(corr):
+            continue
         if corr > best_corr and corr > 0.15:
             best_corr = corr
             best_stride = stride
@@ -275,18 +312,28 @@ class StructureDiscovery:
         # --- Basic entropy ---
         hint.byte_entropy = _byte_entropy(probe)
 
-        # High entropy → already compressed / encrypted → skip transforms
-        if hint.byte_entropy > 7.8:
+        # High entropy → likely already compressed/encrypted, or otherwise
+        # incompressible by structure alone. Threshold matches ASDP's own
+        # cm_precheck_incompressible() entropy gate (cm.cpp) for
+        # consistency, though Python only checks entropy here (cheap,
+        # avoids a wasted probe) — ASDP's C++ precheck additionally checks
+        # match-density before truly giving up, so it correctly still
+        # finds wins on duplicated-but-high-entropy data (e.g. repeated
+        # texture mips) that this Python-side gate alone would miss. That
+        # is fine: skipping a Python transform here does not prevent C++
+        # from finding that win independently afterward, since ASDP runs
+        # regardless of what Python decided.
+        if hint.byte_entropy > 7.9:
             hint.data_class = DataClass.BINARY_BLOB
             hint.confidence = 0.85
-            hint.suggested_transforms = ["zstd"]
+            hint.suggested_transforms = []
             return hint
 
         # --- Text check (fast path) ---
         if _is_text_like(probe):
             hint.data_class = DataClass.TEXT
             hint.element_size = 1
-            hint.suggested_transforms = ["bwt", "mtf", "zstd"]
+            hint.suggested_transforms = []
             hint.confidence = 0.80
             return hint
 
@@ -347,37 +394,23 @@ class StructureDiscovery:
         return best, conf
 
     def _suggest_transforms(self, hint: StructureHint) -> list[str]:
-        transforms: list[str] = []
-        w = hint.element_size
+        """
+        Suggest the upstream (Python-side) transform chain, applied once
+        before data reaches ASDP. Deliberately does NOT suggest
+        bytedelta/bytesplit variants: ASDP's pick_transform_cm() already
+        searches that space empirically (real CM-encoded trial size, not a
+        heuristic), every time, for every block — Python re-suggesting
+        them would either duplicate that work for no gain, or double-apply
+        a transform ASDP would have chosen anyway. The one real gap is
+        columnsplit (true struct-of-arrays reordering across whole
+        records), which ASDP cannot do at all today.
+        """
+        if hint.data_class == DataClass.COLUMNAR and hint.column_stride > 0:
+            return [f"columnsplit-{hint.column_stride}"]
 
-        if hint.data_class == DataClass.BINARY_BLOB:
-            return ["zstd"]
-
-        if hint.data_class == DataClass.TEXT:
-            return ["bwt", "mtf", "zstd"]
-
-        if hint.data_class in (DataClass.INTEGER_ARRAY, DataClass.TIMESERIES):
-            if w > 1:
-                transforms.append(f"bytedelta-{w}")
-            transforms.append("zigzag")
-            transforms.append("zstd")
-            return transforms
-
-        if hint.data_class == DataClass.FLOAT_ARRAY:
-            transforms.append(f"bytesplit-{w}")
-            transforms.append(f"bytedelta-{w}")
-            transforms.append("zstd")
-            return transforms
-
-
-        if hint.data_class == DataClass.COLUMNAR:
-            transforms.append(f"columnsplit-{hint.column_stride}")
-            transforms.append("bytedelta-4")
-            transforms.append("zstd")
-            return transforms
-
-        # Fallback: generic Zstd (matches OpenZL's own fallback)
-        return ["zstd"]
+        # Every other class: hand bytes to ASDP as-is and let
+        # pick_transform_cm's trial-encode make the real call.
+        return []
 
 
 # ---------------------------------------------------------------------------

@@ -3,17 +3,24 @@ k2/src/python/adaptive_optimizer.py
 
 Adaptive Optimization Layer — K2
 ----------------------------------
-K2Pipeline owns the full compression decision: backend selection and structural
-transforms.  All entropy coding is performed by the ASDP-LH C++ backend
-(backend 0x04); there is no zstd/zlib fallback.
+K2Pipeline owns ONE decision: whether to apply a Python-side structural
+transform (currently: columnsplit) before handing data to the ASDP-LH C++
+backend (backend 0x04, the sole entropy backend; there is no zstd/zlib
+fallback). It does NOT pick bytedelta/bytesplit variants — ASDP's own
+pick_transform_cm() already searches that space with a real trial-encode
+against the actual CM-coded size, every block, and Python duplicating that
+search would be slower and less accurate. See structure_discovery.py's
+module docstring for the full division-of-labor rationale.
 
-Backend selection per DataClass:
-  All classes → ASDP-LH entropy backend
-  Structural transforms vary by class:
-    TIMESERIES / INTEGER  → delta ± zigzag
-    FLOAT                 → bytesplit ± delta
-    COLUMNAR              → columnsplit ± delta
-    TEXT / BINARY / OTHER → no transforms
+Per-DataClass strategy space (post-rebuild):
+  COLUMNAR              → columnsplit-N vs raw (2 strategies, bandit picks)
+  everything else       → raw only (no Python-side transform to choose
+                           between; ASDP's trial-encode handles the rest)
+
+The multi-armed-bandit (UCB1) strategy selection and online ratio-feedback
+loop are unchanged in spirit, just operating over the smaller, honest
+strategy space above instead of also picking a (now-removed) neural
+predictor mode.
 
 K2 Frame Format
 ---------------
@@ -29,8 +36,9 @@ Offset  Size  Field
 18+N    ...   ASDP frame (output of asdp_compress)
 
 The C++ bridge reads the frame and:
-  - backend=ASDP → calls asdp_compress(payload), reseals frame.
-                   On decompress: asdp_decompress then invert transforms.
+  - calls asdp_compress(payload), reseals frame via reseal_frame().
+  - On decompress: asdp_decompress then invert transforms via
+    decompress_full().
 """
 
 from __future__ import annotations
@@ -47,7 +55,6 @@ from typing import Callable, Optional
 import numpy as np
 
 from structure_discovery import StructureHint, DataClass
-from hybrid_predictor import HybridConfig, PredictorMode
 
 
 # ---------------------------------------------------------------------------
@@ -124,10 +131,17 @@ def reseal_k2_frame(frame: bytes, new_payload: bytes) -> bytes:
 
 @dataclass
 class Strategy:
+    """
+    A candidate upstream (Python-side) transform choice for the bandit to
+    evaluate. Previously also carried predictor_mode/alpha/chunk_size for
+    a neural-mixing entropy path that has been removed (see
+    hybrid_predictor.py's module docstring) — those fields are gone, since
+    they no longer correspond to any real decision Python makes. The only
+    thing left to choose is the transform chain itself; backend is always
+    ASDP (kept as a field for forward-compat / explicitness, not because
+    there's currently a second option).
+    """
     name: str
-    predictor_mode: PredictorMode
-    alpha: float
-    chunk_size: int
     transforms: list[str]
     backend: int = field(default=_BACKEND_ASDP)
 
@@ -155,64 +169,34 @@ class Strategy:
 # ---------------------------------------------------------------------------
 
 def _default_strategies_for(hint: StructureHint) -> list[Strategy]:
-    strategies: list[Strategy] = []
+    """
+    Build the candidate set for the bandit to choose between.
+
+    Only COLUMNAR data has a genuine two-way choice: apply columnsplit
+    (Python's one real upstream transform) or don't, since whether it
+    helps depends on the actual record layout and isn't free to apply (it
+    costs a full data copy). Every other class has no Python-side
+    transform to choose between any more — ASDP's pick_transform_cm()
+    owns bytedelta/bytesplit selection entirely, with a real trial-encode
+    against actual CM-coded size, every block. Giving those classes a
+    single "raw" strategy is intentional, not a placeholder: there is
+    nothing else for Python to decide for them today, and the bandit
+    degenerating to "one strategy, always picked" is the honest behavior
+    rather than a fake choice between options that don't differ.
+    """
     cls = hint.data_class
-    w   = hint.element_size
 
-    if cls == DataClass.TIMESERIES:
-        strategies += [
-            Strategy("ts_delta_zigzag", PredictorMode.LINEAR_CMA, 0.3, 4096,
-                     [f"bytedelta-{w}", "zigzag"]),
-            Strategy("ts_delta_only",   PredictorMode.LINEAR_CMA, 0.3, 4096,
-                     [f"bytedelta-{w}"]),
-            Strategy("ts_raw",          PredictorMode.PASSTHROUGH, 0.0, 4096,
-                     []),
-        ]
-    elif cls == DataClass.INTEGER_ARRAY:
-        strategies += [
-            Strategy("int_delta",        PredictorMode.LINEAR_CMA, 0.3, 4096,
-                     [f"bytedelta-{w}"]),
-            Strategy("int_delta_zigzag", PredictorMode.LINEAR_CMA, 0.3, 4096,
-                     [f"bytedelta-{w}", "zigzag"]),
-            Strategy("int_raw",          PredictorMode.PASSTHROUGH, 0.0, 4096,
-                     []),
-        ]
-    elif cls == DataClass.FLOAT_ARRAY:
-        strategies += [
-            Strategy("fp_split_delta",  PredictorMode.LINEAR_CMA, 0.25, 8192,
-                     [f"bytesplit-{w}", f"bytedelta-{w}"]),
-            Strategy("fp_split_only",   PredictorMode.LINEAR_CMA, 0.25, 4096,
-                     [f"bytesplit-{w}"]),
-            Strategy("fp_raw",          PredictorMode.PASSTHROUGH, 0.0, 4096,
-                     []),
-        ]
-    elif cls == DataClass.COLUMNAR:
-        s = hint.column_stride or 8
-        strategies += [
-            Strategy("col_split_delta", PredictorMode.LINEAR_CMA, 0.35, 4096,
-                     [f"columnsplit-{s}", "bytedelta-4"]),
-            Strategy("col_split_only",  PredictorMode.PASSTHROUGH, 0.0, 4096,
-                     [f"columnsplit-{s}"]),
-            Strategy("col_raw",         PredictorMode.PASSTHROUGH, 0.0, 4096,
-                     []),
-        ]
-    elif cls == DataClass.TEXT:
-        strategies += [
-            Strategy("text_cma",         PredictorMode.LINEAR_CMA, 0.45, 2048,
-                     []),
-            Strategy("text_passthrough", PredictorMode.PASSTHROUGH, 0.0, 4096,
-                     []),
-        ]
-    else:
-        # BINARY_BLOB / UNKNOWN / MIXED
-        strategies += [
-            Strategy("blob_raw", PredictorMode.PASSTHROUGH, 0.0, 4096, []),
+    if cls == DataClass.COLUMNAR and hint.column_stride > 0:
+        s = hint.column_stride
+        return [
+            Strategy("col_split", [f"columnsplit-{s}"]),
+            Strategy("col_raw",   []),
         ]
 
-    strategies.append(
-        Strategy("raw_fallback", PredictorMode.PASSTHROUGH, 0.0, 4096, [])
-    )
-    return strategies
+    # TIMESERIES / INTEGER_ARRAY / FLOAT_ARRAY / TEXT / BINARY_BLOB /
+    # UNKNOWN / MIXED, and COLUMNAR without a usable detected stride:
+    # nothing for Python to choose, hand bytes to ASDP as-is.
+    return [Strategy("raw", [])]
 
 
 # ---------------------------------------------------------------------------
@@ -267,9 +251,7 @@ class AdaptiveOptimizer:
         extra = extra_strategies or []
         self._strategies: dict[str, Strategy] = {s.name: s for s in base + extra}
         if not self._strategies:
-            self._strategies["raw_fallback"] = Strategy(
-                "raw_fallback", PredictorMode.PASSTHROUGH, 0.0, 4096, []
-            )
+            self._strategies["raw"] = Strategy("raw", [])
         self._current: Optional[Strategy] = None
 
     def select_strategy(self) -> Strategy:
@@ -299,13 +281,9 @@ class AdaptiveOptimizer:
             if strategy_name in self._strategies:
                 self._strategies[strategy_name].record(score)
 
-    def get_config(self, strategy: Strategy) -> HybridConfig:
-        return HybridConfig(
-            mode=strategy.predictor_mode,
-            alpha=strategy.alpha,
-            chunk_size=strategy.chunk_size,
-            use_arithmetic=(strategy.predictor_mode != PredictorMode.PASSTHROUGH),
-        )
+    # get_config / HybridConfig removed — a Strategy's `transforms` list IS
+    # the complete decision now (apply this transform chain, or don't).
+    # There is no longer a separate runtime config object to build from it.
 
     def stats(self) -> dict:
         with self._lock:
@@ -339,21 +317,10 @@ class AdaptiveOptimizer:
                 return 0.0
             return sum(r.throughput_mbs for r in self._window) / len(self._window)
 
-    def tune_alpha(self, strategy: Strategy, step: float = 0.02) -> float:
-        with self._lock:
-            if len(self._window) < 4:
-                return strategy.alpha
-            recent = list(self._window)[-4:]
-            scores = [r.score(self._latency_weight) for r in recent]
-            trend  = scores[-1] - scores[0]
-            if trend > 0.05:
-                new_alpha = min(1.0, strategy.alpha + step)
-            elif trend < -0.05:
-                new_alpha = max(0.0, strategy.alpha - step)
-            else:
-                new_alpha = strategy.alpha
-            strategy.alpha = new_alpha
-            return new_alpha
+    # tune_alpha (continuous-parameter tuning) removed along with
+    # Strategy.alpha — there is no longer a continuous knob to adjust.
+    # The bandit's UCB1 selection over the (now discrete, small) strategy
+    # set is the only tuning mechanism needed.
 
     def compress_with_timing(
         self,
@@ -510,17 +477,23 @@ class K2Pipeline:
 
     C++ bridge entry points
     -----------------------
-    prepare(sample)                             → StructureHint
-    compress_full(data)                         → K2 frame bytes
-      For OpenZL-backend data: frame contains pre-transform bytes as payload;
-      C++ must call reseal_openzl_frame() after running CCtx.
-      For zstd-backend data: frame is complete, C++ passes it through unchanged.
-    reseal_openzl_frame(frame, openzl_payload)  → K2 frame bytes  (C++ calls this)
-    decompress_full(frame)                      → original bytes
-      For OpenZL-backend: C++ runs DCtx first, passes result to decompress_full.
-      For zstd-backend: C++ passes raw frame bytes, Python handles everything.
-    update_final_score(strat, in, out, ms)      → None
-    stats()                                     → dict
+    prepare(sample)                       → StructureHint
+    compress_full(data)                   → K2 frame bytes (pre-transform
+                                             payload; C++ must call
+                                             asdp_compress() then
+                                             reseal_frame())
+    reseal_frame(frame, entropy_payload)  → K2 frame bytes  (C++ calls this
+                                             after asdp_compress() returns)
+    decompress_full(frame)                → original bytes (C++ has
+                                             already run asdp_decompress()
+                                             on the payload before calling)
+    update_final_score(strat, in, out, ms) → None
+    stats()                                → dict
+
+    ASDP-LH (backend 0x04) is the only entropy backend. There is no
+    OpenZL or zstd path — both were removed earlier in this project; any
+    reference to either elsewhere in this codebase's history predates
+    that decision.
     """
 
     def __init__(
@@ -531,13 +504,11 @@ class K2Pipeline:
         probe_bytes: int = 128 * 1024,
     ):
         from structure_discovery import StructureDiscovery
-        from hybrid_predictor import HybridPredictor
 
         self._discovery     = StructureDiscovery(onnx_model_path, probe_bytes)
         self._exploration   = exploration
         self._latency_weight = latency_weight
         self._optimizer: Optional[AdaptiveOptimizer] = None
-        self._predictor: Optional[HybridPredictor]   = None
         self._hint:      Optional[StructureHint]      = None
         self._probe_sample: bytes = b""
 
@@ -552,8 +523,6 @@ class K2Pipeline:
     # ------------------------------------------------------------------
 
     def prepare(self, sample: bytes) -> StructureHint:
-        from hybrid_predictor import HybridPredictor
-
         self._hint         = self._discovery.analyze(sample)
         self._probe_sample = sample[:_GUARD_PROBE_BYTES]
 
@@ -565,6 +534,10 @@ class K2Pipeline:
 
         # Seed each strategy with a realistic warmup score based on zlib-1
         # ratio of transformed probe sample (same scale as real scores).
+        # This is a cheap proxy purely for ordering the bandit's initial
+        # exploration — it does not imply zlib is used for real entropy
+        # coding anywhere; ASDP/CM (backend 0x04) is the only entropy
+        # backend in this pipeline.
         probe     = self._probe_sample
         raw_ratio = max(_zlib1_ratio(probe), 1.0) if probe else 1.0
         for strat in list(self._optimizer._strategies.values()):
@@ -579,9 +552,6 @@ class K2Pipeline:
             self._optimizer._total_plays += 1
 
         init_strat = self._optimizer.select_strategy()
-        cfg        = self._optimizer.get_config(init_strat)
-        self._predictor = HybridPredictor(cfg)
-        self._predictor.train(sample[:min(len(sample), 32768)])
         self._refresh(init_strat)
         return self._hint
 
@@ -666,9 +636,6 @@ class K2Pipeline:
         if not name:
             return
         self._optimizer.record_result(name, input_size, final_compressed_size, elapsed_ms)
-        strat = self._optimizer._strategies.get(name)
-        if strat and strat._n_plays % 10 == 0:
-            self._optimizer.tune_alpha(strat)
 
     # ------------------------------------------------------------------
     # decompress_full — main C++ bridge entry point
@@ -703,23 +670,14 @@ class K2Pipeline:
         return payload
 
     # ------------------------------------------------------------------
-    # Legacy compress/decompress (no-OpenZL path, used by direct tests)
+    # Legacy compress() (pre-C++-mediation entropy path) — removed.
+    # It exercised HybridPredictor.compress(), a pure-Python arithmetic
+    # coder with a zstd fallback that has been removed entirely (see
+    # hybrid_predictor.py's module docstring). There is no remaining
+    # pure-Python entropy path to port this forward to: ASDP/CM (backend
+    # 0x04) is the only entropy backend, and it is C++-only. Use
+    # compress_full() via the C++ bridge for all real compression.
     # ------------------------------------------------------------------
-
-    def compress(self, data: bytes) -> bytes:
-        """Full compress without C++ mediation (uses entropy backend only)."""
-        if self._optimizer is None or self._predictor is None:
-            self.prepare(data[:min(len(data), 65536)])
-        strategy = self._optimizer.select_strategy()
-        cfg = self._optimizer.get_config(strategy)
-        self._predictor._cfg = cfg
-        t0 = time.perf_counter()
-        compressed = self._predictor.compress(data)
-        elapsed_ms = (time.perf_counter() - t0) * 1000.0
-        self._optimizer.record_result(strategy.name, len(data), len(compressed), elapsed_ms)
-        if strategy._n_plays % 10 == 0:
-            self._optimizer.tune_alpha(strategy)
-        return compressed
 
     # ------------------------------------------------------------------
     # Backward-compat shims (C++ bridge currently calls these names)
