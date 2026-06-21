@@ -156,18 +156,13 @@ def label_directory(
     balance / review-queue size before committing to the full run).
 
     force_review_extensions: file extensions (e.g. (".bsa",)) that always
-    go to needs_review regardless of heuristic confidence. Exists because
-    confidence itself can be misleadingly high for archive-container
-    formats: a small probe window landing inside packed mesh/texture data
-    can show genuine local periodicity (high confidence, "COLUMNAR") while
-    being meaningless as a description of the file as a whole, which is
-    opaque packed bytes at the file level -- confirmed directly against a
-    real Skyrim .bsa corpus, where this caused systematic COLUMNAR
-    over-labelling (62/65 auto-accepted chunks in one run) that didn't
-    reflect the actual class distribution at all. Forcing these to manual
-    review lets a human apply judgment the heuristic's confidence score
-    can't be trusted for here, rather than silently absorbing a
-    confidently-wrong label into training data.
+    go to needs_review regardless of heuristic confidence. Archive/container
+    formats can show misleadingly high heuristic confidence: a probe window
+    landing inside packed mesh/texture data may exhibit genuine local
+    periodicity (high confidence, "COLUMNAR") that does not describe the
+    file as a whole, which is opaque packed bytes at the file level.
+    Forcing these to manual review lets a human apply judgment the
+    heuristic's confidence score can't be trusted for here.
     """
     rng = random.Random(seed)
     disc = StructureDiscovery(probe_bytes=probe_bytes)

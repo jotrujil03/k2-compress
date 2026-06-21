@@ -384,7 +384,13 @@ class StructureDiscovery:
             score[DataClass.INTEGER_ARRAY] += 0.3
             score[DataClass.TIMESERIES] += 0.2
 
-        if hint.confidence < 0.5 and hint.element_size == 4 and hint.delta_gain_db < 2.0:
+        # Weak COLUMNAR prior for 4-byte, low-delta data that no other signal
+        # has clearly claimed: FLOAT_ARRAY still wins when detected (0.4 > 0.3).
+        # Previously guarded by `hint.confidence < 0.5`, but hint.confidence is
+        # always 0.0 here (it is set by the caller *after* this method returns),
+        # making that guard a permanent no-op. Removed so the actual behavior is
+        # explicit rather than hidden behind a dead condition.
+        if hint.element_size == 4 and hint.delta_gain_db < 2.0:
             score[DataClass.COLUMNAR] += 0.3
 
         best = max(score, key=lambda c: score[c])

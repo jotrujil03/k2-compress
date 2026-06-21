@@ -574,20 +574,13 @@ class K2Pipeline:
         True if the transform should be applied, False if it should be
         skipped. Uses the trained TransformGainPredictor when one was
         loaded (gain_predictor_path at construction); falls back to the
-        existing zlib-1-ratio probe otherwise -- this is the exact
-        fallback ONNXGainPredictor's docstring described from the start
-        (a missing or stale model degrades to the prior known-correct
-        heuristic, never breaks compression), now actually wired to a
-        real model rather than only ever hitting the fallback branch.
+        zlib-1-ratio probe otherwise (missing/stale model degrades to the
+        prior known-correct heuristic, never breaks compression).
 
         Threshold conversion: _MIN_TRANSFORM_GAIN=1.05 is a plain ratio
-        (current zlib-probe path: gain >= 1.05 -> apply). The trained
-        model predicts log2(gain) directly (confirmed against its
-        training data: positive = columnsplit helped, matching
-        measure_gain_tool's real ASDP/CM measurements) -- log2(1.05) is
-        the equivalent threshold in the model's own units, used so both
-        paths apply the same real-world bar for "worth it", not two
-        different thresholds that happen to share a variable name.
+        (zlib-probe path: gain >= 1.05 -> apply). The trained model
+        predicts log2(gain), so the equivalent threshold is log2(1.05) —
+        both paths apply the same real-world bar for "worth it".
         """
         if self._gain_predictor.available:
             feats = _extract_features(self._probe_sample[:_GUARD_PROBE_BYTES], element_size=4)
@@ -609,7 +602,7 @@ class K2Pipeline:
         The payload is always pre-transform bytes; the C++ bridge calls
         asdp_compress(payload) then reseal_frame().
 
-        Always returns bytes.  Never raises (falls back to raw frame on error).
+        Always returns bytes.
         """
         if self._optimizer is None:
             self.prepare(data[:min(len(data), 65536)])
@@ -632,20 +625,16 @@ class K2Pipeline:
     def reseal_frame(self, frame: bytes, entropy_payload: bytes) -> bytes:
         """
         Replace the payload in an entropy-backend (ASDP) K2 frame with the
-        output of asdp_compress().  Called by the C++ bridge.  Backend byte and
-        txhdr are preserved; also records the real compressed size for the bandit.
+        output of asdp_compress(). Called by the C++ bridge. Backend byte and
+        txhdr are preserved unchanged.
+
+        Bandit scoring is NOT done here; the C++ bridge calls
+        update_final_score() after this with the real elapsed time and
+        compressed size. update_final_score() is the single scorer for every
+        event, so the bandit is never double-counted.
         """
         backend, orig_size, txhdr, _ = decode_k2_frame(frame)
-        sealed = encode_k2_frame(backend, orig_size, txhdr, entropy_payload)
-        # Record with real size
-        strat = self._optimizer._strategies.get(self._active_strategy) if self._optimizer else None
-        if strat:
-            ratio_score = math.log2(max(orig_size / max(len(entropy_payload), 1), 1.0))
-            strat._n_plays     += 1
-            strat._total_score += ratio_score
-            if self._optimizer:
-                self._optimizer._total_plays += 1
-        return sealed
+        return encode_k2_frame(backend, orig_size, txhdr, entropy_payload)
 
     # Backward-compat alias (older C++ bridges called this name).
     def reseal_openzl_frame(self, frame: bytes, openzl_payload: bytes) -> bytes:

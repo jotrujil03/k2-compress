@@ -217,10 +217,9 @@ static void test_roundtrip_text() {
 
 static void test_roundtrip_backend_dispatch() {
     std::printf("\n[test_roundtrip_backend_dispatch]\n");
-    // Verify that both OpenZL-backend (timeseries) and
-    // entropy-backend (text) produce valid roundtrips via the C API.
-    // The test doesn't inspect which backend was chosen — only that
-    // compress/decompress are inverses of each other.
+    // Verify that multiple data types produce valid roundtrips via the
+    // C API.  The test doesn't inspect which backend was chosen — only
+    // that compress/decompress are inverses of each other.
 
     struct TestCase { const char* label; std::vector<uint8_t> data; };
     std::vector<TestCase> cases = {

@@ -195,7 +195,7 @@ Point `StructureDiscovery`/`K2Pipeline` at the resulting `.onnx` files via their
 ## Integration Notes
 
 - The C++ bridge safely manages the embedded Python runtime and releases the GIL during performance-critical operations.
-- `K2Handle` objects are not thread-safe; use one per thread or serialize access.
+- Multiple threads may share a single `K2Handle`: Python calls (compress, decompress, prepare) are serialized by the GIL, while ASDP runs GIL-free in parallel within each call.
 - Compressed `.k2` frames and `.k2a` archives are self-describing and versioned.
 - `K2A` archives are processed one block at a time sequentially (each block internally parallelizes across `n_threads` via ASDP); this keeps memory bounded to one block's buffers regardless of total archive size, and is what makes the K2A layer thread-safe by construction — see `k2a_format_design.md` for the full design rationale, including a documented bug (now fixed) where this sequential design initially defeated internal parallelism.
 - ASDP/CM has been audited with ThreadSanitizer and AddressSanitizer against its real parallel compress/decompress path; two data races and one heap-buffer-underflow were found and fixed. See the ASDP-LH README for details.

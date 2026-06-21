@@ -435,22 +435,15 @@ ArchiveError pack_directory(const std::string& input_dir,
     // archive-level thread pool is needed, memory stays bounded to one
     // block's buffers, and volume writes are strictly sequential.
     //
-    // IMPORTANT — bug fixed here, confirmed by direct observation (single
-    // core active during compress, all cores active during decompress):
-    // acfg.min_block_bytes is the floor for ASDP's OWN internal sub-block
-    // splitting within a single asdp_compress() call. It is a DIFFERENT
-    // knob from cfg.block_target_bytes (which controls K2A-level file
-    // grouping, chosen for ratio reasons — see the design doc). Setting
-    // acfg.min_block_bytes = cfg.block_target_bytes made every K2A block
-    // buffer exactly equal to ASDP's own splitting floor, so
-    // asdp_compress()'s plan_blocks() always took its "src_len <=
-    // min_block" early-out and produced a single internal block —
-    // compression silently ran single-threaded for every K2A block,
-    // regardless of cfg.n_threads, while decompression (which uses
-    // asdp_default_config()'s untouched min_block_bytes) parallelized
-    // correctly. These two knobs must stay independent: leave ASDP's
-    // internal floor at its own default so a K2A block has room to split
-    // across threads internally.
+    // IMPORTANT: acfg.min_block_bytes is the floor for ASDP's OWN internal
+    // sub-block splitting within a single asdp_compress() call — a DIFFERENT
+    // knob from cfg.block_target_bytes (K2A-level file grouping, ratio-tuned).
+    // These two must stay independent: if acfg.min_block_bytes is set to
+    // cfg.block_target_bytes, every K2A block buffer matches ASDP's splitting
+    // floor, asdp_compress()'s plan_blocks() always takes the "src_len <=
+    // min_block" early-out, and compression silently runs single-threaded
+    // regardless of cfg.n_threads. Leave ASDP's internal floor at its own
+    // default so each K2A block can split across threads internally.
     asdp_config_t acfg = asdp_default_config();
     acfg.level = cfg.asdp_level;
     acfg.n_threads = cfg.n_threads;

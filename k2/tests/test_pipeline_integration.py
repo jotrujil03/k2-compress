@@ -344,15 +344,22 @@ class TestK2Pipeline:
     @staticmethod
     def _fake_asdp_roundtrip(pipeline: K2Pipeline, data: bytes) -> bytes:
         """
-        Stands in for what the real C++ bridge does: call compress_full()
-        to get the pre-ASDP frame, then reseal_frame() with the payload
-        unchanged (identity 'compression') instead of a real
-        asdp_compress() call. Returns the final sealed frame, exactly the
-        bytes decompress_full() expects.
+        Stands in for what the real C++ bridge does:
+          1. compress_full() → pre-ASDP K2 frame
+          2. reseal_frame() with the payload unchanged (identity in place of
+             a real asdp_compress() call)
+          3. update_final_score() → bandit feedback with the real payload size
+             and 0 ms elapsed (the real C++ bridge calls record_result() here,
+             which feeds update_final_score(); omitting it left the rolling
+             window empty so recent_ratio() always returned the 1.0 default)
+        Returns the sealed frame exactly as decompress_full() expects it.
         """
         frame = pipeline.compress_full(data)
         backend, orig_size, txhdr, payload = decode_k2_frame(frame)
-        return pipeline.reseal_frame(frame, payload)
+        sealed = pipeline.reseal_frame(frame, payload)
+        pipeline.update_final_score(
+            pipeline._active_strategy, len(data), len(payload), 0.0)
+        return sealed
 
     def test_prepare_and_compress(self):
         pipeline = K2Pipeline(exploration=1.0)
@@ -390,27 +397,29 @@ class TestK2Pipeline:
 
     def test_multiple_chunks_track_ratio(self):
         """
-        With more chunks, reseal_frame() should keep recording real
-        ratios into the bandit. We verify the bandit's recorded ratio
-        stays sane (not zero/negative) across repeated calls, since the
-        identity fake-ASDP step here means every chunk's "ratio" is
-        exactly 1.0x by construction -- the real ratio-improvement
-        property (does the bandit converge to a BETTER strategy over
-        time) needs real ASDP and belongs in an end-to-end test against
-        the actual C++ bridge, not this Python-only file.
+        Verifies that the rolling window is populated after multiple chunks,
+        and that recent_ratio() reflects real recorded data (not the 1.0
+        empty-window default). With identity ASDP the ratio is always 1.0,
+        so the assertion is on window population, not ratio magnitude — the
+        real convergence property needs actual ASDP and belongs in the C++
+        test suite.
         """
         pipeline = K2Pipeline(exploration=0.5)
         data = make_timeseries(32768)
         pipeline.prepare(data[:4096])
 
         chunk_size = 4096
+        n_chunks = 0
         for i in range(0, len(data), chunk_size):
             chunk = data[i: i + chunk_size]
             if not chunk:
                 continue
             self._fake_asdp_roundtrip(pipeline, chunk)
+            n_chunks += 1
 
         assert pipeline.stats()["recent_ratio"] > 0
+        window_maxlen = pipeline._optimizer._window.maxlen
+        assert len(pipeline._optimizer._window) == min(n_chunks, window_maxlen)
 
     def test_different_data_types(self):
         """Pipeline should handle all data types without exceptions."""
