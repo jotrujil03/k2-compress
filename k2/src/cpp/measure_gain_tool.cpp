@@ -19,17 +19,11 @@
 //   measure_gain_tool <input_file> <columnsplit_stride> [offset] [length]
 //
 // offset/length are OPTIONAL and bound the read to a chunk of the file
-// instead of reading the whole thing -- added after a real run against a
-// ~20GB game-asset directory showed this tool reading and compressing
-// entire multi-hundred-MB/GB files (BSA archives) per "sample" when
-// train_predictor.py's gain-predictor command actually intends each
-// sample to be a bounded probe_bytes-sized chunk (matching
-// label_corpus.py's ChunkRef model elsewhere in this pipeline). Without
-// offset/length, a single large input file could make one "sample" take
-// many minutes of real CM compression time -- confirmed directly via
-// py-spy showing the Python caller blocked in subprocess.communicate()
-// on exactly this. If omitted, reads the whole file (preserves the
-// original behavior for direct/manual invocation).
+// rather than the whole thing. REQUIRED when called from train_predictor.py,
+// which passes probe_bytes-sized ChunkRef bounds so each "sample" is a
+// manageable window rather than an entire large archive (which would run
+// full ASDP/CM compression twice on hundreds of MB per sample). If omitted,
+// reads the whole file (preserves the original behavior for manual use).
 //
 // Output (stdout, one line, space-separated):
 //   <orig_bytes> <raw_compressed_bytes> <columnsplit_compressed_bytes>

@@ -3,21 +3,18 @@
  *
  * C++ Bridge: K2 Neural Pipeline
  * --------------------------------
- * K2Pipeline (Python) owns the full compression decision.  The C++ bridge:
- *   - For zstd/zlib backends: passes K2 frames through unchanged.
- *   - For the ASDP backend:   calls asdp_compress() on the (pre-transform)
- *                             payload, then reseals the K2 frame around the
- *                             ASDP output.  On decompress it calls
- *                             asdp_decompress() first, reseals, then lets
- *                             Python invert the structural transforms.
- *
- * OpenZL has been removed (fix D).  The structured-data entropy backend is now
- * ASDP-LH (fix E); text/binary continue to route to zstd in Python.
+ * K2Pipeline (Python) owns the full compression decision.  The C++ bridge
+ * handles entropy (ASDP-LH, backend 0x04 — the sole live backend; 0x01–0x03
+ * are retired):
+ *   - calls asdp_compress() on the (pre-transform) payload, then reseals
+ *     the K2 frame around the ASDP output.  On decompress it calls
+ *     asdp_decompress() first, reseals, then lets Python invert the
+ *     structural transforms.
  *
  * K2 Frame Format (owned by Python, parsed by C++ for dispatch only):
  *   [0..3]   magic  b'K2\xf7\x01'
  *   [4]      version  0x01
- *   [5]      backend  0x02=zstd  0x03=zlib  0x04=ASDP   (0x01 OpenZL retired)
+ *   [5]      backend  0x04=ASDP  (0x01/02/03 retired)
  *   [6]      flags
  *   [7]      reserved
  *   [8..15]  orig_size  uint64 LE
@@ -26,18 +23,14 @@
  *
  * Compress path:
  *   compress_full(data) -> K2 frame
- *   if backend == ASDP:
- *     payload = asdp_compress(frame.payload)     // GIL released here
- *     frame   = reseal_frame(frame, payload)
+ *   payload = asdp_compress(frame.payload)     // GIL released here
+ *   frame   = reseal_frame(frame, payload)
  *   return frame
  *
  * Decompress path:
- *   if backend == ASDP:
- *     inner = asdp_decompress(frame.payload)      // GIL released here
- *     resealed = reseal_frame(frame, inner)
- *     decompress_full(resealed) -> original bytes // Python inverts transforms
- *   else:
- *     decompress_full(frame) -> original bytes     (Python does entropy)
+ *   inner    = asdp_decompress(frame.payload)  // GIL released here
+ *   resealed = reseal_frame(frame, inner)
+ *   decompress_full(resealed) -> original bytes // Python inverts transforms
  */
 
 #pragma once
@@ -152,8 +145,8 @@ static constexpr uint8_t  K2_FRAME_MAGIC[4] = {
 };
 static constexpr uint8_t  K2_FRAME_VERSION  = 0x01;
 static constexpr uint8_t  K2_BACKEND_OPENZL = 0x01;  // retired; kept for decode guard
-static constexpr uint8_t  K2_BACKEND_ZSTD   = 0x02;
-static constexpr uint8_t  K2_BACKEND_ZLIB   = 0x03;
+static constexpr uint8_t  K2_BACKEND_ZSTD   = 0x02;  // retired — decode guard only
+static constexpr uint8_t  K2_BACKEND_ZLIB   = 0x03;  // retired — decode guard only
 static constexpr uint8_t  K2_BACKEND_ASDP   = 0x04;
 static constexpr size_t   K2_FRAME_HDR_SIZE = 18;  // through txhdr_len field
 
