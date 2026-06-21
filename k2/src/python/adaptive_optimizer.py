@@ -54,7 +54,7 @@ from typing import Callable, Optional
 
 import numpy as np
 
-from structure_discovery import StructureHint, DataClass
+from structure_discovery import StructureHint, DataClass, _extract_features
 
 
 # ---------------------------------------------------------------------------
@@ -499,13 +499,16 @@ class K2Pipeline:
     def __init__(
         self,
         onnx_model_path: Optional[str] = None,
+        gain_predictor_path: Optional[str] = None,
         exploration: float = 1.0,
         latency_weight: float = 0.15,
         probe_bytes: int = 128 * 1024,
     ):
         from structure_discovery import StructureDiscovery
+        from hybrid_predictor import ONNXGainPredictor
 
         self._discovery     = StructureDiscovery(onnx_model_path, probe_bytes)
+        self._gain_predictor = ONNXGainPredictor(gain_predictor_path)
         self._exploration   = exploration
         self._latency_weight = latency_weight
         self._optimizer: Optional[AdaptiveOptimizer] = None
@@ -559,12 +562,41 @@ class K2Pipeline:
         """Apply guard and update active state from strategy."""
         ops = _ops_from_transforms(strategy.transforms)
         if ops and self._probe_sample:
-            if _probe_transform_gain(self._probe_sample, ops) < _MIN_TRANSFORM_GAIN:
+            if self._predicted_gain_ok(ops) is False:
                 ops = []
         self._active_ops      = ops
         self._active_txhdr    = _encode_txhdr(ops)
         self._active_backend  = _BACKEND_ASDP
         self._active_strategy = strategy.name
+
+    def _predicted_gain_ok(self, ops: list[tuple[int, int]]) -> bool:
+        """
+        True if the transform should be applied, False if it should be
+        skipped. Uses the trained TransformGainPredictor when one was
+        loaded (gain_predictor_path at construction); falls back to the
+        existing zlib-1-ratio probe otherwise -- this is the exact
+        fallback ONNXGainPredictor's docstring described from the start
+        (a missing or stale model degrades to the prior known-correct
+        heuristic, never breaks compression), now actually wired to a
+        real model rather than only ever hitting the fallback branch.
+
+        Threshold conversion: _MIN_TRANSFORM_GAIN=1.05 is a plain ratio
+        (current zlib-probe path: gain >= 1.05 -> apply). The trained
+        model predicts log2(gain) directly (confirmed against its
+        training data: positive = columnsplit helped, matching
+        measure_gain_tool's real ASDP/CM measurements) -- log2(1.05) is
+        the equivalent threshold in the model's own units, used so both
+        paths apply the same real-world bar for "worth it", not two
+        different thresholds that happen to share a variable name.
+        """
+        if self._gain_predictor.available:
+            feats = _extract_features(self._probe_sample[:_GUARD_PROBE_BYTES], element_size=4)
+            predicted_log2_gain = self._gain_predictor.predict(feats)
+            if predicted_log2_gain is not None:
+                return predicted_log2_gain >= math.log2(_MIN_TRANSFORM_GAIN)
+        # Fallback: original zlib-1 ratio probe (model unavailable, or a
+        # genuine prediction failure on this particular sample).
+        return _probe_transform_gain(self._probe_sample, ops) >= _MIN_TRANSFORM_GAIN
 
     # ------------------------------------------------------------------
     # compress_full — main C++ bridge entry point

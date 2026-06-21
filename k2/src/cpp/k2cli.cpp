@@ -50,7 +50,12 @@ static void write_file(const std::string& path, const uint8_t* data, size_t len)
 static K2Handle* make_handle() {
     const char* onnx_env = std::getenv("K2_ONNX_MODEL");
     std::string onnx     = onnx_env ? onnx_env : "";
-    K2Handle* h = k2_create(onnx.empty() ? nullptr : onnx.c_str(), 1.0, 0.15);
+    const char* gain_env = std::getenv("K2_GAIN_MODEL");
+    std::string gain     = gain_env ? gain_env : "";
+    K2Handle* h = k2_create_ex(
+        onnx.empty() ? nullptr : onnx.c_str(),
+        gain.empty() ? nullptr : gain.c_str(),
+        1.0, 0.15);
     if (!h) { std::cerr << "k2cli: failed to create pipeline\n"; std::exit(1); }
     return h;
 }
@@ -69,6 +74,7 @@ static void usage() {
         "\n"
         "Environment:\n"
         "  K2_ONNX_MODEL   path to ONNX classifier model (optional)\n"
+        "  K2_GAIN_MODEL   path to ONNX transform-gain predictor model (optional)\n"
         "\n"
         "Output format: K2 native frame.\n"
         "Not compatible with zli decompress.\n";

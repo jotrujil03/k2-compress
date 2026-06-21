@@ -67,6 +67,22 @@ K2_API K2Handle* k2_create(
     double      latency_weight
 );
 
+/**
+ * Extended constructor: like k2_create, but also accepts a path to a
+ * trained TransformGainPredictor ONNX model. Pass nullptr/"" for
+ * gain_predictor_path to get exactly k2_create's behavior (the gain
+ * guard then falls back to the built-in zlib-ratio heuristic). Added as
+ * a separate function rather than a 4th parameter on k2_create so every
+ * existing 3-argument caller (and the compiled ABI) keeps working
+ * unchanged.
+ */
+K2_API K2Handle* k2_create_ex(
+    const char* onnx_model_path,
+    const char* gain_predictor_path,
+    double      exploration,
+    double      latency_weight
+);
+
 K2_API int k2_prepare(
     K2Handle*      handle,
     const uint8_t* sample,
@@ -190,7 +206,8 @@ public:
         const std::string& onnx_model_path = "",
         double exploration    = 1.0,
         double latency_weight = 0.15,
-        int    asdp_level     = 4
+        int    asdp_level     = 3,
+        const std::string& gain_predictor_path = ""
     ) : _asdp_level(asdp_level)
     {
         py::gil_scoped_acquire gil;
@@ -200,10 +217,13 @@ public:
         py::object  cls = mod.attr("K2Pipeline");
         py::object onnx = onnx_model_path.empty()
             ? py::none() : py::cast(onnx_model_path);
+        py::object gain = gain_predictor_path.empty()
+            ? py::none() : py::cast(gain_predictor_path);
         _pipeline = cls(
-            "onnx_model_path"_a = onnx,
-            "exploration"_a     = exploration,
-            "latency_weight"_a  = latency_weight
+            "onnx_model_path"_a     = onnx,
+            "gain_predictor_path"_a = gain,
+            "exploration"_a         = exploration,
+            "latency_weight"_a      = latency_weight
         );
     }
 
@@ -312,15 +332,12 @@ public:
     std::string stats() {
         py::gil_scoped_acquire gil;
         py::dict d = _pipeline.attr("stats")();
-        d["asdp_n_blocks"]        = _last_asdp_stats.n_blocks;
-        d["asdp_n_threads_used"]  = _last_asdp_stats.n_threads_used;
         return py::module_::import("json").attr("dumps")(d).cast<std::string>();
     }
 
 private:
     py::object _pipeline;
     int        _asdp_level;
-    asdp_stats_t _last_asdp_stats{};
 
     // ------------------------------------------------------------------
     // ASDP entropy backend (pure C++, no GIL).  A context is created per
@@ -338,7 +355,6 @@ private:
         std::vector<uint8_t> out(bound);
         size_t out_len = 0;
         const int rc = asdp_compress(ctx, pl, plen, out.data(), bound, &out_len);
-        asdp_stats(ctx, &_last_asdp_stats);
         asdp_destroy(ctx);
         if (rc != ASDP_OK)
             throw std::runtime_error(std::string("asdp_compress: ") + asdp_error_str(rc));

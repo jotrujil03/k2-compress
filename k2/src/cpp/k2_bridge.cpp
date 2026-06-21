@@ -71,25 +71,39 @@ void interp_release() {
 
 extern "C" {
 
-K2_API K2Handle* k2_create(const char* onnx_model_path,
-                            double exploration,
-                            double latency_weight) {
+K2_API K2Handle* k2_create_ex(const char* onnx_model_path,
+                               const char* gain_predictor_path,
+                               double exploration,
+                               double latency_weight) {
     try {
         interp_acquire();
         auto* h = new K2Handle();
         std::string onnx = onnx_model_path ? onnx_model_path : "";
+        std::string gain = gain_predictor_path ? gain_predictor_path : "";
         // Bridge ctor acquires the GIL per py::gil_scoped_acquire internally.
-        h->bridge = new k2::Bridge(K2_PYTHON_MODULE_DIR, onnx, exploration, latency_weight);
+        // gain_predictor_path is the Bridge ctor's last parameter (after
+        // asdp_level), so the default asdp_level=3 is passed explicitly here.
+        h->bridge = new k2::Bridge(K2_PYTHON_MODULE_DIR, onnx, exploration,
+                                    latency_weight, /*asdp_level=*/3, gain);
         return h;
     } catch (const std::exception& e) {
-        fprintf(stderr, "k2_create failed: %s\n", e.what());
+        fprintf(stderr, "k2_create_ex failed: %s\n", e.what());
         interp_release();
         return nullptr;
     } catch (...) {
-        fprintf(stderr, "k2_create failed: unknown exception\n");
+        fprintf(stderr, "k2_create_ex failed: unknown exception\n");
         interp_release();
         return nullptr;
     }
+}
+
+K2_API K2Handle* k2_create(const char* onnx_model_path,
+                            double exploration,
+                            double latency_weight) {
+    // Backward-compatible wrapper: no gain predictor model -> the gain
+    // guard uses its built-in zlib-ratio heuristic, exactly as before
+    // this function gained an _ex variant.
+    return k2_create_ex(onnx_model_path, nullptr, exploration, latency_weight);
 }
 
 K2_API void k2_destroy(K2Handle* h) {

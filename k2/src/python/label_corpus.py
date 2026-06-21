@@ -146,6 +146,7 @@ def label_directory(
     auto_accept_threshold: float,
     sample_fraction: float = 1.0,
     seed: int = 0,
+    force_review_extensions: tuple[str, ...] = (),
 ) -> tuple[list[LabelledChunk], list[LabelledChunk]]:
     """
     Returns (auto_accepted, needs_review).
@@ -153,9 +154,24 @@ def label_directory(
     sample_fraction < 1.0 randomly subsamples chunks before classification
     (useful for a first pass over a very large corpus to gauge class
     balance / review-queue size before committing to the full run).
+
+    force_review_extensions: file extensions (e.g. (".bsa",)) that always
+    go to needs_review regardless of heuristic confidence. Exists because
+    confidence itself can be misleadingly high for archive-container
+    formats: a small probe window landing inside packed mesh/texture data
+    can show genuine local periodicity (high confidence, "COLUMNAR") while
+    being meaningless as a description of the file as a whole, which is
+    opaque packed bytes at the file level -- confirmed directly against a
+    real Skyrim .bsa corpus, where this caused systematic COLUMNAR
+    over-labelling (62/65 auto-accepted chunks in one run) that didn't
+    reflect the actual class distribution at all. Forcing these to manual
+    review lets a human apply judgment the heuristic's confidence score
+    can't be trusted for here, rather than silently absorbing a
+    confidently-wrong label into training data.
     """
     rng = random.Random(seed)
     disc = StructureDiscovery(probe_bytes=probe_bytes)
+    force_review_extensions = tuple(e.lower() for e in force_review_extensions)
 
     auto_accepted: list[LabelledChunk] = []
     needs_review: list[LabelledChunk] = []
@@ -180,7 +196,8 @@ def label_directory(
             heuristic_class=hint.data_class.name,
             heuristic_confidence=hint.confidence,
         )
-        if hint.confidence >= auto_accept_threshold:
+        forced = force_review_extensions and ref.file_path.lower().endswith(force_review_extensions)
+        if hint.confidence >= auto_accept_threshold and not forced:
             auto_accepted.append(row)
         else:
             needs_review.append(row)
@@ -241,11 +258,21 @@ def main() -> None:
                              "Use < 1.0 for a quick first pass over a very "
                              "large corpus.")
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--force-review-extensions", nargs="*", default=[],
+                        help="File extensions (e.g. .bsa) that always go to "
+                             "the review queue regardless of heuristic "
+                             "confidence. Use for archive/container formats "
+                             "where a small probe window can show "
+                             "misleadingly high-confidence local structure "
+                             "(e.g. periodicity from packed mesh data) that "
+                             "doesn't reflect the file's actual content as "
+                             "a whole.")
     args = parser.parse_args()
 
     auto_accepted, needs_review = label_directory(
         args.data_dir, args.probe_bytes, args.max_chunks_per_file,
         args.auto_accept_threshold, args.sample_fraction, args.seed,
+        force_review_extensions=tuple(args.force_review_extensions),
     )
 
     auto_path = os.path.join(args.output_dir, "auto_accepted.jsonl")

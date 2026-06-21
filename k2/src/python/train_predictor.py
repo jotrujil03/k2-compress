@@ -330,17 +330,34 @@ def train_classifier_cmd(args: argparse.Namespace) -> None:
 # Subcommand 2: transform-gain predictor
 # ---------------------------------------------------------------------------
 
-def _measure_gain(measure_tool: str, file_path: str, stride: int) -> Optional[float]:
+def _measure_gain(measure_tool: str, file_path: str, stride: int,
+                   offset: Optional[int] = None, length: Optional[int] = None) -> Optional[float]:
     """
     Calls measure_gain_tool, returns log2(raw_compressed / split_compressed)
     -- positive means columnsplit helped, negative means it hurt. Returns
     None on any failure (tool missing, file unreadable, etc.) so the caller
     can skip that sample rather than crash a long training-data-generation
     run over one bad file.
+
+    offset/length bound the measurement to a chunk of the file rather than
+    the whole thing -- REQUIRED for real use. Without them, a single large
+    source file (a multi-hundred-MB/GB game archive, say) makes
+    measure_gain_tool run real ASDP/CM compression on the entire file
+    twice, which can take many minutes per "sample" -- confirmed directly
+    via py-spy showing a real run blocked in subprocess.communicate() on
+    exactly this, against a Skyrim BSA file. The caller (train_predictor.py)
+    already computes correctly-bounded ChunkRef objects via iter_chunks()
+    for this exact purpose; previously only ref.file_path was passed
+    through here, silently discarding ref.offset/ref.length and measuring
+    the whole file regardless of how small the intended sample was meant
+    to be.
     """
+    cmd = [measure_tool, file_path, str(stride)]
+    if offset is not None and length is not None:
+        cmd += [str(offset), str(length)]
     try:
         result = subprocess.run(
-            [measure_tool, file_path, str(stride)],
+            cmd,
             capture_output=True, text=True, timeout=120,
         )
     except (OSError, subprocess.TimeoutExpired):
@@ -386,7 +403,8 @@ def train_gain_predictor_cmd(args: argparse.Namespace) -> None:
     X, y = [], []
     n_measured, n_skipped = 0, 0
     for i, ref in enumerate(refs):
-        gain = _measure_gain(args.measure_tool, ref.file_path, args.stride)
+        gain = _measure_gain(args.measure_tool, ref.file_path, args.stride,
+                              offset=ref.offset, length=ref.length)
         if gain is None:
             n_skipped += 1
             continue
