@@ -149,15 +149,85 @@ def _train_loop(
 
 def _export_onnx(model: "nn.Module", in_dim: int, output_path: str,
                   input_name: str, output_name: str) -> None:
+    """
+    Exports model to ONNX with a dynamic batch dimension.
+
+    torch 2.9+ defaults torch.onnx.export to the newer torch.export-based
+    ("dynamo=True") exporter, which wants dynamic_shapes (built from
+    torch.export.Dim) instead of the older dynamic_axes dict -- passing
+    dynamic_axes there now prints a UserWarning and is silently converted
+    on a best-effort basis rather than used directly.
+
+    Also stopped requesting opset_version=13: on the dynamo path, the
+    exporter builds the graph at a newer internal opset and then tries to
+    DOWNGRADE to whatever opset_version was requested via onnxscript's
+    version converter. That downgrade step itself was failing on a real
+    run (RuntimeError: No Adapter From Version 16 for Identity) and
+    silently falling back to keeping the newer opset anyway -- so the
+    requested 13 was never actually being honored, just generating a
+    scary-looking but harmless traceback. onnxruntime handles the
+    resulting newer opset fine (confirmed against onnxruntime 1.27); no
+    reason to keep requesting a downgrade that doesn't work and isn't
+    needed.
+
+    Tries the new dynamic_shapes API first; falls back to the old
+    dynamic_axes/opset_version=13 path on a torch version old enough that
+    torch.onnx.export doesn't accept dynamic_shapes at all (pre-2.9-ish),
+    so this keeps working across a range of torch versions rather than
+    only the one this was last tested against.
+
+    Also passes dynamic_axes alongside dynamic_shapes on the primary
+    attempt: torch's own 2.9 docs recommend this explicitly, since the
+    dynamo exporter can internally fall back to the older TorchScript path
+    (exactly what happened during the real run that surfaced this whole
+    issue, triggered by the opset-downgrade failure) -- without
+    dynamic_axes also present, that internal fallback would silently
+    export a static-batch-size model instead of erroring, which would be
+    a much harder bug to notice than a loud failure.
+
+    IMPORTANT: dynamic_shapes keys by the model's actual forward()
+    PYTHON ARGUMENT NAME (traced via torch.export), which is completely
+    unrelated to input_name/output_name here (those are only the
+    ONNX-graph-facing labels passed to input_names/output_names -- pure
+    metadata for the exported graph, never seen by torch.export at all).
+    Both StructureClassifier.forward(self, x) and
+    TransformGainPredictor.forward(self, x) take a single positional
+    argument named x, so the correct dict key is "x", not input_name's
+    value ("features"/"gain") -- confirmed by a real run: keying with
+    input_name raised "top-level keys must be the arg names ['x'] of
+    inputs, but here they are ['features']". To avoid hardcoding "x" and
+    silently breaking again if a model's forward() signature ever
+    changes, dynamic_shapes is specified POSITIONALLY (a tuple matching
+    the args tuple) instead of by name -- this is the documented
+    alternative torch's own error message points to ("you could also
+    ignore arg names entirely and specify dynamic_shapes as a list/tuple
+    matching inputs").
+    """
     Path(output_path).parent.mkdir(parents=True, exist_ok=True)
     model.eval()
     dummy = torch.zeros(1, in_dim, dtype=torch.float32)
-    torch.onnx.export(
-        model, (dummy,), output_path,
-        input_names=[input_name], output_names=[output_name],
-        dynamic_axes={input_name: {0: "batch"}},
-        opset_version=13,
-    )
+
+    try:
+        batch = torch.export.Dim("batch")
+        torch.onnx.export(
+            model, (dummy,), output_path,
+            input_names=[input_name], output_names=[output_name],
+            dynamic_shapes=({0: batch},),  # positional: matches the (dummy,) args tuple
+            dynamic_axes={input_name: {0: "batch"}},
+        )
+    except TypeError:
+        # Older torch: torch.onnx.export doesn't know dynamic_shapes at
+        # all (raises TypeError on the unexpected kwarg) -- fall back to
+        # the pre-2.9 dynamo=False-style API, where dynamic_axes and an
+        # explicit opset_version are both the correct, non-deprecated way
+        # to do this.
+        torch.onnx.export(
+            model, (dummy,), output_path,
+            input_names=[input_name], output_names=[output_name],
+            dynamic_axes={input_name: {0: "batch"}},
+            opset_version=13,
+        )
+
     size_kb = os.path.getsize(output_path) / 1e3
     print(f"Exported ONNX model to {output_path} ({size_kb:.1f} KB)")
 
