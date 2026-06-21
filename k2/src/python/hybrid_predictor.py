@@ -158,12 +158,16 @@ class ONNXGainPredictor:
         return self._session is not None
 
     def predict(self, features: np.ndarray) -> Optional[float]:
-        """Returns predicted log2(gain ratio), or None if unavailable."""
+        """Returns predicted log2(gain ratio), or None if unavailable or if
+        inference fails (e.g. a corrupted session state after successful load)."""
         if self._session is None:
             return None
-        inp_name = self._session.get_inputs()[0].name
-        out = self._session.run(None, {inp_name: features.astype(np.float32)})[0]
-        return float(out.reshape(-1)[0])
+        try:
+            inp_name = self._session.get_inputs()[0].name
+            out = self._session.run(None, {inp_name: features.astype(np.float32)})[0]
+            return float(out.reshape(-1)[0])
+        except Exception:
+            return None
 
 
 @dataclass

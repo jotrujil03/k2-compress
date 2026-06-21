@@ -632,20 +632,20 @@ class K2Pipeline:
     def reseal_frame(self, frame: bytes, entropy_payload: bytes) -> bytes:
         """
         Replace the payload in an entropy-backend (ASDP) K2 frame with the
-        output of asdp_compress().  Called by the C++ bridge.  Backend byte and
-        txhdr are preserved; also records the real compressed size for the bandit.
+        output of asdp_compress(). Called by the C++ bridge. Backend byte and
+        txhdr are preserved unchanged.
+
+        Bandit scoring is NOT done here. The C++ bridge calls record_result()
+        after this, which feeds update_final_score() with the real elapsed time
+        and compressed size. Updating the bandit in both places double-counted
+        every event: play counts grew 2x fast and the score was added twice with
+        different weight functions (pure ratio here vs ratio+latency in
+        update_final_score). The rolling window (_window, backing recent_ratio())
+        was only ever populated by update_final_score anyway, so removing the
+        update here is a pure fix with no lost information.
         """
         backend, orig_size, txhdr, _ = decode_k2_frame(frame)
-        sealed = encode_k2_frame(backend, orig_size, txhdr, entropy_payload)
-        # Record with real size
-        strat = self._optimizer._strategies.get(self._active_strategy) if self._optimizer else None
-        if strat:
-            ratio_score = math.log2(max(orig_size / max(len(entropy_payload), 1), 1.0))
-            strat._n_plays     += 1
-            strat._total_score += ratio_score
-            if self._optimizer:
-                self._optimizer._total_plays += 1
-        return sealed
+        return encode_k2_frame(backend, orig_size, txhdr, entropy_payload)
 
     # Backward-compat alias (older C++ bridges called this name).
     def reseal_openzl_frame(self, frame: bytes, openzl_payload: bytes) -> bytes:
