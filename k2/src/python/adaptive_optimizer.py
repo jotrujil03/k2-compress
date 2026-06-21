@@ -574,20 +574,13 @@ class K2Pipeline:
         True if the transform should be applied, False if it should be
         skipped. Uses the trained TransformGainPredictor when one was
         loaded (gain_predictor_path at construction); falls back to the
-        existing zlib-1-ratio probe otherwise -- this is the exact
-        fallback ONNXGainPredictor's docstring described from the start
-        (a missing or stale model degrades to the prior known-correct
-        heuristic, never breaks compression), now actually wired to a
-        real model rather than only ever hitting the fallback branch.
+        zlib-1-ratio probe otherwise (missing/stale model degrades to the
+        prior known-correct heuristic, never breaks compression).
 
         Threshold conversion: _MIN_TRANSFORM_GAIN=1.05 is a plain ratio
-        (current zlib-probe path: gain >= 1.05 -> apply). The trained
-        model predicts log2(gain) directly (confirmed against its
-        training data: positive = columnsplit helped, matching
-        measure_gain_tool's real ASDP/CM measurements) -- log2(1.05) is
-        the equivalent threshold in the model's own units, used so both
-        paths apply the same real-world bar for "worth it", not two
-        different thresholds that happen to share a variable name.
+        (zlib-probe path: gain >= 1.05 -> apply). The trained model
+        predicts log2(gain), so the equivalent threshold is log2(1.05) —
+        both paths apply the same real-world bar for "worth it".
         """
         if self._gain_predictor.available:
             feats = _extract_features(self._probe_sample[:_GUARD_PROBE_BYTES], element_size=4)
@@ -609,7 +602,7 @@ class K2Pipeline:
         The payload is always pre-transform bytes; the C++ bridge calls
         asdp_compress(payload) then reseal_frame().
 
-        Always returns bytes.  Never raises (falls back to raw frame on error).
+        Always returns bytes.
         """
         if self._optimizer is None:
             self.prepare(data[:min(len(data), 65536)])
@@ -635,14 +628,10 @@ class K2Pipeline:
         output of asdp_compress(). Called by the C++ bridge. Backend byte and
         txhdr are preserved unchanged.
 
-        Bandit scoring is NOT done here. The C++ bridge calls record_result()
-        after this, which feeds update_final_score() with the real elapsed time
-        and compressed size. Updating the bandit in both places double-counted
-        every event: play counts grew 2x fast and the score was added twice with
-        different weight functions (pure ratio here vs ratio+latency in
-        update_final_score). The rolling window (_window, backing recent_ratio())
-        was only ever populated by update_final_score anyway, so removing the
-        update here is a pure fix with no lost information.
+        Bandit scoring is NOT done here; the C++ bridge calls
+        update_final_score() after this with the real elapsed time and
+        compressed size. update_final_score() is the single scorer for every
+        event, so the bandit is never double-counted.
         """
         backend, orig_size, txhdr, _ = decode_k2_frame(frame)
         return encode_k2_frame(backend, orig_size, txhdr, entropy_payload)

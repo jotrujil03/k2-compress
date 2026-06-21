@@ -340,17 +340,11 @@ def _measure_gain(measure_tool: str, file_path: str, stride: int,
     run over one bad file.
 
     offset/length bound the measurement to a chunk of the file rather than
-    the whole thing -- REQUIRED for real use. Without them, a single large
-    source file (a multi-hundred-MB/GB game archive, say) makes
-    measure_gain_tool run real ASDP/CM compression on the entire file
-    twice, which can take many minutes per "sample" -- confirmed directly
-    via py-spy showing a real run blocked in subprocess.communicate() on
-    exactly this, against a Skyrim BSA file. The caller (train_predictor.py)
-    already computes correctly-bounded ChunkRef objects via iter_chunks()
-    for this exact purpose; previously only ref.file_path was passed
-    through here, silently discarding ref.offset/ref.length and measuring
-    the whole file regardless of how small the intended sample was meant
-    to be.
+    the whole thing -- REQUIRED for real use. Without them, a large source
+    file (a multi-hundred-MB/GB game archive) makes measure_gain_tool run
+    real ASDP/CM compression on the entire file twice, which can take many
+    minutes per sample. The caller passes ChunkRef.offset/length to keep
+    each measurement bounded to the actual probe window.
     """
     cmd = [measure_tool, file_path, str(stride)]
     if offset is not None and length is not None:
