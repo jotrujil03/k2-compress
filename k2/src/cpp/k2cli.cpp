@@ -161,7 +161,7 @@ static int cmd_decompress(const std::string& in_path, const std::string& out_pat
     K2Handle* h = make_handle();
     // Read orig_size from the K2 frame header; fall back to a generous bound
     // only if the header is unreadable (truncated / corrupt input).
-    const uint64_t orig_size = frame_orig_size(data.data(), data.size());
+    const uint64_t orig_size = k2::frame_orig_size(data.data(), data.size());
     std::vector<uint8_t> out(orig_size > 0 ? orig_size : data.size() * 20 + 4096);
     size_t out_len = 0;
     int rc = k2_decompress(h, data.data(), data.size(), out.data(), out.size(), &out_len);
