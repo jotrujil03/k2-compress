@@ -55,7 +55,7 @@ def _show_chunk(row: LabelledChunk, data: bytes, idx: int, total: int) -> None:
     print(f"offset: {row.offset}  length: {row.length}")
     print(f"heuristic guess: {row.heuristic_class}  "
           f"(confidence {row.heuristic_confidence:.2f})")
-    print(f"preview (first 64 bytes):\n  {_hex_preview(data)}")
+    print(f"preview (first {len(data)} bytes):\n  {_hex_preview(data, n=len(data))}")
     print()
     print("Pick a class, or [enter] to accept the heuristic's guess:")
     for i, c in enumerate(_CLASSES, start=1):
