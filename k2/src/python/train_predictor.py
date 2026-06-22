@@ -252,8 +252,9 @@ def _load_labelled_chunks(labels_dir: str) -> list[LabelledChunk]:
 
     review_path = os.path.join(labels_dir, "needs_review.jsonl")
     if os.path.exists(review_path):
-        reviewed = [r for r in read_jsonl(review_path) if r.human_class is not None]
-        skipped = sum(1 for r in read_jsonl(review_path) if r.human_class is None)
+        _review_rows = read_jsonl(review_path)
+        reviewed = [r for r in _review_rows if r.human_class is not None]
+        skipped = sum(1 for r in _review_rows if r.human_class is None)
         if skipped:
             print(f"note: {skipped} reviewed-queue chunks have no human_class "
                   f"yet (skipped or not yet reached) — excluded from training.")
